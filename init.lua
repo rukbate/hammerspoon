@@ -1,6 +1,7 @@
-require "weather"
 require "spoon"
+require "clipboard"
+require "weather"
 require "window"
 require "wifi"
-require "clipboard"
+
 require "test"
