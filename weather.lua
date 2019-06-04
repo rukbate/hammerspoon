@@ -22,9 +22,9 @@ function updateMenubar()
 end
 
 function getWeather()
-   hs.http.doAsyncRequest(urlApi, "GET", nil,nil, function(code, body, htable)
+   hs.http.doAsyncRequest(urlApi, "GET", nil, nil, function(code, body, htable)
       if code ~= 200 then
-         print('get weather error:'..code)
+         print('get weather error:' .. code)
          return
       end
       rawjson = hs.json.decode(body)
@@ -33,13 +33,13 @@ function getWeather()
       for k, v in pairs(rawjson.data) do
          if k == 1 then
             menubar:setTitle(weaEmoji[v.wea_img])
-            titlestr = string.format("%s %s %s 🌡️%s 💧%s 💨%s 🌬 %s %s", city,weaEmoji[v.wea_img],v.day, v.tem, v.humidity, v.air, v.win_speed, v.wea)
+            titlestr = string.format("%s  %s  %s  🌡️%s  💧%s  💨%s  🌬%s  %s", city, v.day, weaEmoji[v.wea_img], v.tem, v.humidity, v.air, v.win_speed, v.wea)
             item = { title = titlestr }
             table.insert(menuData, item)
             table.insert(menuData, {title = '-'})
          else
             -- titlestr = string.format("%s %s %s %s", v.day, v.wea, v.tem, v.win_speed)
-            titlestr = string.format("%s %s %s 🌡️%s 🌬%s %s", city, weaEmoji[v.wea_img],v.day, v.tem, v.win_speed, v.wea)
+            titlestr = string.format("%s  %s  %s  🌡️%s  🌬%s  %s", city, v.day, weaEmoji[v.wea_img], v.tem, v.win_speed, v.wea)
             item = { title = titlestr }
             table.insert(menuData, item)
          end
