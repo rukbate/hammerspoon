@@ -51,4 +51,13 @@ end
 menubar:setTitle('⌛')
 getWeather()
 updateMenubar()
-hs.timer.doEvery(3600, getWeather)
+hs.timer.doEvery(720, getWeather)
+
+function weatherWifiCallback()
+   ssid = hs.wifi.currentNetwork()
+   if (ssid ~= nil) then
+      getWeather()
+   end
+end
+weatherWifiWatcher = hs.wifi.watcher.new(weatherWifiCallback)
+weatherWifiWatcher:start()
