@@ -1,8 +1,8 @@
 function setProxy()
     os.execute("networksetup -setautoproxystate 'Wi-Fi' off")
-    os.execute("echo 1234 | networksetup -setwebproxy 'Wi-Fi' 127.0.0.1 8080 on 1604692")
+    os.execute("networksetup -setwebproxy 'Wi-Fi' 10.24.129.241 8080 on 1604692")
     os.execute("networksetup -setwebproxystate 'Wi-Fi' on")
-    os.execute("echo 1234 | networksetup -setsecurewebproxy 'Wi-Fi' 127.0.0.1 8080 on 1604692")
+    os.execute("networksetup -setsecurewebproxy 'Wi-Fi' 10.24.129.241 8080 on 1604692")
     os.execute("networksetup -setsecurewebproxystate 'Wi-Fi' on")
 end
 
