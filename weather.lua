@@ -1,4 +1,4 @@
-local urlApi = 'https://www.tianqiapi.com/api/?version=v1'
+local urlApi = 'https://www.tianqiapi.com/api/?version=v1&dummy='
 local menubar = hs.menubar.new()
 local menuData = {}
 
@@ -22,7 +22,7 @@ function updateMenubar()
 end
 
 function getWeather()
-   hs.http.doAsyncRequest(urlApi, "GET", nil, nil, function(code, body, htable)
+   hs.http.doAsyncRequest(urlApi .. os.time(), "GET", nil, nil, function(code, body, htable)
       if code ~= 200 then
          print('get weather error:' .. code)
          return
