@@ -45,7 +45,7 @@ function getWeather()
          end
       end
       updateMenubar()
-      hs.notify.new({title="Weather", informativeText="Weather updated ..."}):send()
+      -- hs.notify.new({title="Weather", informativeText="Weather updated ..."}):send()
    end)
 end
 

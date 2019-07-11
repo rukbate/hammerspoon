@@ -22,8 +22,8 @@ function ssidChangedCallback()
         else
             unsetProxy()
         end
-    else
-        hs.notify.new({title="Wifi", informativeText="Wifi disconnected"}):send()
+    -- else
+        -- hs.notify.new({title="Wifi", informativeText="Wifi disconnected"}):send()
     end
 end
 
