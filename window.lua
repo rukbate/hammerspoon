@@ -98,3 +98,41 @@ hs.hotkey.bind({"cmd", "alt", "ctrl"}, "Down", function()
     f.h = max.h / 2
     win:setFrame(f)
 end)
+
+-- Move current window to next screen
+hs.hotkey.bind({"cmd", "alt", "ctrl"}, "]", function()
+    local win = hs.window.focusedWindow()
+    if not win then return end
+    local currentScreen = win:screen()
+    local allScreens = hs.screen.allScreens()
+    if #allScreens < 2 then return end
+
+    local currentIndex = 1
+    for i, s in ipairs(allScreens) do
+        if s == currentScreen then
+            currentIndex = i
+            break
+        end
+    end
+    local nextIndex = (currentIndex % #allScreens) + 1
+    win:moveToScreen(allScreens[nextIndex])
+end)
+
+-- Move current window to previous screen
+hs.hotkey.bind({"cmd", "alt", "ctrl"}, "[", function()
+    local win = hs.window.focusedWindow()
+    if not win then return end
+    local currentScreen = win:screen()
+    local allScreens = hs.screen.allScreens()
+    if #allScreens < 2 then return end
+
+    local currentIndex = 1
+    for i, s in ipairs(allScreens) do
+        if s == currentScreen then
+            currentIndex = i
+            break
+        end
+    end
+    local prevIndex = ((currentIndex - 2) % #allScreens) + 1
+    win:moveToScreen(allScreens[prevIndex])
+end)
