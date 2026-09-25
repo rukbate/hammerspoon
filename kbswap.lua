@@ -22,6 +22,8 @@
 ---            eventtap 引擎是「自动 → 强制交换 → 强制关闭」三态。
 --- 菜单栏图标：实心键盘 = 蓝牙键盘在线，斜杠键盘 = 不在线；
 ---            点击只显示当前状态，不切换模式（切换走热键）。
+--- 提示：蓝牙键盘连上/断开时弹 "Keyboard connected / disconnected"（措辞见
+---       M.msgConnected / M.msgDisconnected）。
 
 local M = {}
 
@@ -35,7 +37,9 @@ M.pollInterval = 5          -- 检测间隔（秒）
 M.profilerTTL  = 30         -- system_profiler 结果的缓存时间（秒），它是唯一慢的一环
 M.reassert     = 60         -- 每隔多久重挂一次映射（秒）。防休眠唤醒后映射悄悄失效
 M.swapRight    = true       -- 是否连右侧 ⌥/⌘（usage 0xE6/0xE7）一起换
-M.notify       = true       -- 状态变化时弹提示
+M.notify       = true       -- 蓝牙键盘连接/断开时弹提示
+M.msgConnected    = "Keyboard connected: %s"    -- %s = 设备名（拿不到时自动去掉分隔符）
+M.msgDisconnected = "Keyboard disconnected"
 M.debug        = false      -- 打开后每次下发/失败都打印到 Console
 M.hotkeyMods   = { "ctrl", "alt", "cmd" }
 M.hotkeyKey    = "k"
@@ -680,18 +684,35 @@ local function refreshMenubar()
     M.menubarItem:setTooltip(tip .. "\n" .. statusLine() .. "\n点击查看状态（切换模式用 ⌃⌥⌘K）")
 end
 
-local function notify()
-    if not M.notify then return end
-    local msg
-    if M.mode == "off" then
-        msg = "⌘ ⇄ ⌥ 已停用"
-    elseif M.active then
-        msg = "⌘ ⇄ ⌥ 已交换"
-        if M.lastDevice then msg = msg .. "：" .. M.lastDevice end
-    else
-        msg = "⌘ ⇄ ⌥ 已还原"
+--- 蓝牙键盘上下线时的提示。
+--- 触发点是「连接状态翻转」，与「交换是否生效」解耦：旧版把它挂在 M.active 上，
+--- 于是模式切换、下发失败也会弹「已交换/已还原」——那是跟键盘上下线无关的噪声。
+--- 两种场景的措辞由 M.msgConnected / M.msgDisconnected 决定（%s = 设备名）。
+local lastConn = nil
+local function notifyConn()
+    local connected = keyboardConnected()
+
+    if not M.notify then
+        lastConn = connected          -- 关掉提示期间也要跟踪，免得打开时补弹一条旧的
+        return
     end
-    hs.alert.show(msg, 0.9)
+    if lastConn == nil then
+        lastConn = connected          -- 加载首轮不弹：重载配置不该报「已连接」
+        return
+    end
+    if connected == lastConn then return end
+    lastConn = connected
+
+    if connected then
+        local msg = M.msgConnected
+        if msg:find("%%s") then
+            msg = string.format(msg, M.lastDevice or "")
+            msg = msg:gsub("%s*$", "")   -- 名字拿不到时不留尾随空格
+        end
+        hs.alert.show(msg, 1.0)
+    else
+        hs.alert.show(M.msgDisconnected, 1.0)
+    end
 end
 
 --- @return boolean 当前模式下是否应该处于「已交换」
@@ -712,7 +733,6 @@ local function tickHidutil()
     local listOut = hs.execute(HIDUTIL .. " list --ndjson 2>&1")
     M.targets = filterTargets(aggregate(parseHidList(listOut)))
 
-    local was = M.active
     if shouldApply() then
         local okCount = 0
         for _, t in ipairs(M.targets) do
@@ -724,8 +744,6 @@ local function tickHidutil()
         clearAll()
         M.active = false
     end
-
-    if M.active ~= was then notify() end
 end
 
 --- tap 自己的运行状态。不能拿 M.active 当判据 —— 两个引擎切换时它会串味。
@@ -739,7 +757,6 @@ local function tickEventtap()
     local tap = ensureTap()
     if want then tap:start() else tap:stop() end
     tapRunning, M.active = want, want
-    notify()
 end
 
 local function tick()
@@ -750,6 +767,7 @@ local function tick()
         refreshProfiler(false)  -- hidutil 的开关靠 hidutil list，这个只用来分类
         tickHidutil()
     end
+    notifyConn()     -- 键盘上下线提示（内部去重，只在状态翻转时弹一次）
     refreshMenubar() -- 图标状态跟设备连接情况走，每轮校对一次（内部有去重）
 end
 
