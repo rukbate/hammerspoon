@@ -20,8 +20,9 @@
 ---
 --- 热键 ⌃⌥⌘K：hidutil 引擎在「跟随蓝牙键盘 ⇄ 停用」间切换；
 ---            eventtap 引擎是「自动 → 强制交换 → 强制关闭」三态。
---- 菜单栏图标：实心键盘 = 蓝牙键盘在线，斜杠键盘 = 不在线；
----            点击只显示当前状态，不切换模式（切换走热键）。
+--- 菜单栏图标：实心键盘 = 蓝牙键盘在线，斜杠键盘 = 不在线。
+--- 点击 = 打开/关闭系统「辅助功能键盘」（axkeyboard.lua，蓝牙键盘断开时的应急输入）。
+--- 切换 ⌘/⌥ 交换模式只走 ⌃⌥⌘K。
 --- 提示：蓝牙键盘连上/断开时弹 "Keyboard connected / disconnected"（措辞见
 ---       M.msgConnected / M.msgDisconnected）。
 
@@ -681,7 +682,7 @@ local function refreshMenubar()
     else
         tip = "蓝牙键盘未连接"
     end
-    M.menubarItem:setTooltip(tip .. "\n" .. statusLine() .. "\n点击查看状态（切换模式用 ⌃⌥⌘K）")
+    M.menubarItem:setTooltip(tip .. "\n" .. statusLine() .. "\n点击打开/关闭屏幕键盘（切换模式用 ⌃⌥⌘K）")
 end
 
 --- 蓝牙键盘上下线时的提示。
@@ -849,10 +850,13 @@ if M.mode == "off" then clearStale() end
 if M.showMenubar then
     M.menubarItem = hs.menubar.new(true, M.menubarAutosaveName)
     if M.menubarItem then
-        -- 点击只显示当前状态，绝不改 mode —— 之前版本点击会循环模式，
-        -- 容易在只想看一眼状态时把交换整个关掉。切换模式请用 ⌃⌥⌘K。
+        -- 点击 = 开/关自绘屏幕键盘（osk.lua 经 _G.hsOnScreenKeyboard 暴露，
+        -- 解耦：kbswap 不 require osk，加载顺序无关）。备用方案 axkeyboard.lua
+        -- （系统无障碍键盘）保留在盘上但不加载。
+        -- ⌘/⌥ 交换模式的切换仍只走 ⌃⌥⌘K。
         M.menubarItem:setClickCallback(function()
-            hs.alert.show(statusLine(), 0.9)
+            local kb = _G.hsOnScreenKeyboard
+            if kb and kb.toggle then kb.toggle() end
         end)
     end
 end
