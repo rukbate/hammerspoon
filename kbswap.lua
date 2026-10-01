@@ -21,7 +21,8 @@
 --- 热键 ⌃⌥⌘K：hidutil 引擎在「跟随蓝牙键盘 ⇄ 停用」间切换；
 ---            eventtap 引擎是「自动 → 强制交换 → 强制关闭」三态。
 --- 菜单栏图标：实心键盘 = 蓝牙键盘在线，斜杠键盘 = 不在线。
---- 点击 = 打开/关闭系统「辅助功能键盘」（axkeyboard.lua，蓝牙键盘断开时的应急输入）。
+---点击 = 打开/关闭自绘屏幕键盘（osk.lua，蓝牙键盘断开时的应急输入）。
+---      系统「无障碍键盘」方案（axkeyboard.lua）已降级为备用，未在 init.lua 中加载。
 --- 切换 ⌘/⌥ 交换模式只走 ⌃⌥⌘K。
 --- 提示：蓝牙键盘连上/断开时弹 "Keyboard connected / disconnected"（措辞见
 ---       M.msgConnected / M.msgDisconnected）。

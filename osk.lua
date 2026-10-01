@@ -53,6 +53,8 @@ M._drag = nil           -- 拖动中：{ mx, my, fx, fy }（鼠标起点 + 面�
 M._canvas = nil
 M._frame = nil          -- 面板屏幕坐标 { x, y, w, h }（eventtap 命中判定用，NS 坐标）
 M.debugLog = false      -- 临时诊断（/tmp/osk-debug.log），已核实坐标，默认关
+M.level       = "assistiveTechHigh" -- 窗口层级：系统辅助面板那一档，盖住任何 App 窗口
+                        -- 想低调点可改 "overlay" / "floating"（后者会被部分 App 盖住）
 M._repeat = nil         -- 按住连发的定时器
 M._tap = nil            -- 事件拦截 tap
 M._watchdog = nil       -- tap 看门狗（系统禁用后自动重启）
@@ -225,13 +227,6 @@ end
 -- 按键处理（由 eventtap 事件驱动，不再走 canvas 鼠标回调）
 --------------------------------------------------------------------------------
 
---- 找到 id 对应的键记录。
-local function keyById(id)
-    for _, k in ipairs(M._keys) do
-        if k.def.id == id then return k end
-    end
-end
-
 --- 屏幕坐标 → 命中的键记录（面板局部坐标做几何命中）。
 local function hitTest(gx, gy)
     if not M._frame then return nil end
@@ -320,9 +315,16 @@ local function onTap(ev)
                     if loc then
                         local nx = M._drag.fx + (loc.x - M._drag.mx)
                         local ny = M._drag.fy + (loc.y - M._drag.my)
+                        -- 越界钳制：把面板留在当前屏幕内，避免拖到屏幕外找不回来
+                        local sf = hs.screen.mainScreen():frame()
+                        nx = math.max(sf.x, math.min(nx, sf.x + sf.w - M._frame.w))
+                        ny = math.max(sf.y, math.min(ny, sf.y + sf.h - M._frame.h))
                         M._canvas:topLeft({ x = nx, y = ny })
                         M._frame.x = nx
                         M._frame.y = ny
+                        -- 起点跟着走：否则第二次拖动的偏移量会越来越离谱
+                        M._drag.mx, M._drag.my = loc.x, loc.y
+                        M._drag.fx, M._drag.fy = nx, ny
                     end
                 end
                 -- 按住键时拖动（无 _drag）：只吞事件，不打断连发
@@ -334,6 +336,15 @@ local function onTap(ev)
                 releaseKey()
                 return true
             end
+        end
+
+        -- 面板内但没在「按住」状态的左键 up/dragged 也必须吞掉。
+        -- 典型场景：在面板外按下鼠标 → 拖进面板 → 松手。此时 _capturing 为
+        -- false，这个 mouseUp 会漏给画布窗口，AppKit 收到就激活 Hammerspoon
+        -- ——正是 v3 要根治的抢焦点。判定只看坐标在不在面板内。
+        if t == types.leftMouseUp or t == types.leftMouseDragged then
+            local loc = ev:location()
+            if loc and inPanel(loc.x, loc.y) then return true end
         end
 
         -- 右键/中键落在面板内：吞掉，避免右键菜单/激活把 Hammerspoon 拉到前台
@@ -451,10 +462,42 @@ local function build(x, y)
     end
 
     -- 纯显示层：不开任何鼠标跟踪（点击由 eventtap 在上游拦截）。
-    c:level(hs.canvas.windowLevels.floating)
+    -- 层级要足够高：普通 App 窗口（Docker Desktop 这类全屏大窗口）激活时会盖到
+    -- floating 层之上，所以直接用系统辅助面板那一档。
+    c:level(hs.canvas.windowLevels[M.level] or M.level)
     -- canJoinAllSpaces：所有空间（含全屏 App）上层都可见。不叠加 moveToActiveSpace ——
     -- 两者语义冲突，canJoinAllSpaces 已经覆盖了「出现在当前空间」。
     c:behaviorAsLabels({ "canJoinAllSpaces" })
+end
+
+--- 把面板顶回最前。别的 App 激活时（Docker Desktop 之类），它的窗口会盖到画布
+--- 前面；每次激活事件都重新断言一次层级，保证键盘始终在最上层。
+function M.raise()
+    if not M._canvas then return end
+    pcall(function()
+        M._canvas:level(hs.canvas.windowLevels[M.level] or M.level)
+        M._canvas:orderAbove()
+    end)
+end
+
+--- 显示期间监听 App 激活，趁机把面板顶回最前。
+local function startRaiseWatcher()
+    if M._raiseWatcher then return end
+    local ok = pcall(function()
+        M._raiseWatcher = hs.application.watcher.new(function(_, event)
+            if event == hs.application.watcher.activated and M.isShowing() then
+                hs.timer.doAfter(0.05, M.raise)
+            end
+        end)
+        if M._raiseWatcher then M._raiseWatcher:start() end
+    end)
+    if not ok then M._raiseWatcher = nil end
+end
+
+local function stopRaiseWatcher()
+    if not M._raiseWatcher then return end
+    pcall(function() M._raiseWatcher:stop() end)
+    M._raiseWatcher = nil
 end
 
 function M.show()
@@ -495,6 +538,8 @@ function M.show()
         }, onTap)
     end
     M._tap:start()
+    startRaiseWatcher()
+    M.raise()
     -- 临时诊断：确认 tap 真的启动了
     if M.debugLog then
         local f = io.open("/tmp/osk-debug.log", "a")
@@ -519,6 +564,7 @@ function M.hide()
     M._pressing = nil
     if M._canvas then M._canvas:hide() end
     if M._tap then M._tap:stop() end
+    stopRaiseWatcher()
     if M._watchdog then M._watchdog:stop() end
     M._watchdog = nil
 end

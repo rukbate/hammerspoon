@@ -6,7 +6,16 @@ Lin 的 macOS Hammerspoon 配置。围绕「蓝牙键盘 / 鼠标 / 触控板」
 
 ### init.lua — 加载入口
 
-按依赖顺序 require 各模块。被注释掉的是当前停用的模块（`clipboard`、`weather`、`wifi`），文件保留、随时可开。
+按依赖顺序 require 各模块（`osk` 必须在 `kbswap` 之前，因为 kbswap 的图标点击回调要调 osk 暴露的开关）。
+
+当前停用（文件保留、取消注释即可启用）：
+
+| 模块 | 停用原因 |
+| --- | --- |
+| `scroll` | Lin 于 2026-10-01 手动注释停用（与反转滚动的使用习惯冲突） |
+| `clipboard` | 2026-10-01 已整理掉全局变量污染，待重新启用 |
+| `weather` | 2026-10-01 已改为读环境变量，**需先配置 `TIANQI_APPID` / `TIANQI_APPSECRET`** |
+| `axkeyboard` | 备用方案，功能正常但每次要经过系统设置 |
 
 ### kbswap.lua — 蓝牙键盘 ⌘/⌥ 对调 + 菜单栏键盘图标
 
@@ -21,37 +30,61 @@ Lin 的 macOS Hammerspoon 配置。围绕「蓝牙键盘 / 鼠标 / 触控板」
 
 - ANSI 布局 6 行 76 键：F 功能键排（esc 在第一排最左）+ 主键区；⌫ / 方向键按住连发；修饰键 sticky（点一下上膛、作用于下一键）；caps 为纯内部状态。
 - **点击不抢焦点**（v3 根治版）：键盘显示期间挂 session 级 eventtap，凡落在面板内的鼠标事件一律在上游截获丢弃——AppKit 看不见点击，焦点始终留在目标 App，合成按键直达输入框。
-- 面板可拖动（按住顶部把手条 / 键位缝隙拖），`M.scale`（默认 1.4）统一缩放整体尺寸，触摸屏使用友好。
+- 面板可拖动（按住顶部把手条 / 键位缝隙拖），`M.scale`（默认 1.4）统一缩放整体尺寸，触摸屏使用友好。拖动越界会被钳制在主屏内，避免面板被拖丢找不回来。
+- 层级 `M.level = "assistiveTechHigh"`，并挂了 application watcher：任何 App 被激活就把面板重新 raise 一次（否则会被 Docker 等全屏窗口盖住）。
 
 ### axkeyboard.lua — 系统「无障碍键盘」开关（备用，未加载）
 
 点击 kbswap 图标开关 macOS 自带的辅助功能键盘：deep link 打开系统设置对应窗格 → AX API 找到并按压开关 → 成功后自动关掉设置窗口。功能正常，但每次都要经过系统设置，故降级为备用；`init.lua` 里注释着，要启用取消注释即可。
 
-### scroll.lua — 滚动方向反转 + 平滑滚动
+### scroll.lua — 滚动方向反转 + 平滑滚动（**当前停用**）
 
 - 反转：macOS「自然滚动」是全局开关，这里拦 scrollWheel 事件只对外接鼠标反向，触控板保持自然。
-- 平滑（可选，`M.smooth = true`）：滚轮的行级离散事件先攒进缓冲区，按 1/125 秒的节奏做指数衰减式发放，合成像素级连续滚动（类似 Mos 的效果）。关键参数 `M.smoothPixelsPerLine = 33`（整体速度）。
+- 平滑（`M.smooth = true`）：滚轮的行级离散事件先攒进缓冲区，按 1/125 秒的节奏做指数衰减式发放，合成像素级连续滚动。关键参数 `M.smoothPixelsPerLine = 33`（整体速度）、`M.smoothDecay = 0.30`、`M.smoothMaxBuffer = 240`。
+- 防死循环：合成事件带自己的 PID + 连续/相位全零指纹，识别为自造后不再二次处理。
 - 菜单栏图标（assets 里的 scroll-on/off）随时开关。
+- **2026-10-01 被 Lin 手动注释停用**，`init.lua` 里取消注释即可恢复。
 
 ### window.lua — 窗口管理热键
 
-`⌘⌥⌃F` 最大化当前窗口等几个基础窗口操作。
+9 个 `⌘⌥⌃` 组合键，全部作用于当前焦点窗口；焦点不在任何窗口上（Finder 桌面等）时静默退出。
+
+| 键 | 动作 |
+| --- | --- |
+| `F` | 铺满当前屏幕（`usableFrame`） |
+| `←` `→` `↑` `↓` | 贴到对应半边，**只挪位置不改窗口尺寸** |
+| `M` | 左右各留 12%（窗口居中，左右等宽） |
+| `N` | 四边各留 20%（窗口居中） |
+| `[` `]` | 窗口移到上/ 下一块屏幕，到头后环绕 |
 
 ### screen.lua — 截屏工具
 
-`⌘⇧S` 触发 macOS 自带的截屏 / 录屏面板（`⌘⇧5`）。
+| 键 | 动作 |
+| --- | --- |
+| `⌘⇧S` | 打开系统截屏 / 录屏面板（`⌘⇧5`，面板没有命令行等价物） |
+| `⌃⌥⌘A` | 交互式截屏（拖拽选区 / 点选窗口，可复制到剪贴板） |
+| `⌃⌥⌘W` | 同上，但只能点选窗口 |
+
+后两条走 `/usr/sbin/screencapture -i` / `-i -w`。2026-10-01 重写：旧版是「模拟按 ⌘⇧4 → 硬等 0.1 秒 → 模拟按空格」，面板没起来就什么都不会发生，面板起得慢还会误吞紧接着的按键。
 
 ### spoon.lua — Spoon 加载器
 
-加载并启动 `Spoons/Caffeine`（菜单栏咖啡杯，防止休眠）。
+加载并启动 `Spoons/Caffeine`（菜单栏咖啡杯，防止休眠）。`hs.loadSpoon` 返回 nil 时只打印提示、不崩。
 
 ### weather.lua — 天气（未加载）
 
-菜单栏天气，tianqiapi 接口。已停用。
+菜单栏天气，天天气 API。2026-10-01 重写：**API 密钥改为从环境变量读**（原来硬编码在源码里、且已进 git 历史，等于公开），未配置就不加载；全局变量全部收进模块表；HTTP/JSON 错误路径不再崩。启用前先设置：
+
+```sh
+export TIANQI_APPID=xxxxx
+export TIANQI_APPSECRET=xxxxx
+```
+
+> 原密钥 `55364454 / ey8L74Yp` 仍在 git 历史里。若在意，去天天气后台重置一次。
 
 ### clipboard.lua — 剪贴板历史（未加载）
 
-Jumpcut 风格的剪贴板管理（基于 victorso 的实现改）。已停用。
+Jumpcut 风格的剪贴板管理（基于 victorso 的实现改），`⌘⇧V` 弹出菜单。2026-10-01 整理：所有函数和状态收进 local 并 `return M`（原来 `subStringUTF8` / `setTitle` / `putOnPaste` / `storeCopy` / `timer` 等 14 个名字都是全局）；剪贴板被清空时不再把 `nil` 塞进历史（会导致后续 `string.len` 崩）。
 
 ## 目录
 
@@ -64,5 +97,14 @@ Jumpcut 风格的剪贴板管理（基于 victorso 的实现改）。已停用�
 ## 开发约定
 
 - 改完配置在 Hammerspoon 菜单栏手动 **Reload Config**，不自动重启。
-- 模块改动配套离线测试（lupa 驱动的 Lua 断言），改前跑一遍防回归。
+- 模块改动配套离线测试（lupa 驱动的 Lua 断言，在 `.workbuddy/skills/hammerspoon-config-test/`），改前跑一遍防回归：
+
+  ```sh
+  cd ~/.hammerspoon/.workbuddy/skills/hammerspoon-config-test
+  ~/.workbuddy/binaries/python/envs/default/bin/python run-lua-test.py example-<module>-test.lua
+  ```
+
+  注意带 `os.exit()` 的测试（clipboard / spoon）要单独跑——`SystemExit` 会终止运行器。
 - 涉及权限的功能先想 TCC / 代码签名；不要动 `/Applications/Hammerspoon.app` 的 Info.plist（会破坏签名与已有授权）。
+- **写 Hammerspoon 脚本时热键键名一律小写**（`f` / `left` / `right`，不是 `F` / `Left`）。`hs.keycodes.map` 里没有大写项，传大写不可靠。
+- 模块不要往 `_G` 里撒全局变量，一律 `local` + `return M`。
