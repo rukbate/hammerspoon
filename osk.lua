@@ -23,6 +23,13 @@
 --- 位置：默认贴屏幕底边居中；`M.avoidInput = true` 时会先看一眼当前输入焦点
 ---   （AX 取插入光标，退化到输入框），输入区压在下半屏就把键盘翻到顶部，
 ---   免得挡住正在看的那行字。AX 拿不到就静默退回贴底，不影响显示。
+---   每次 show 的探测过程都写 /tmp/osk-ax.log ——「为什么没躲开」在屏幕上完全
+---   看不出来（不报错也没提示），排查只能看它。
+---   注意（2026-10-02，Word 正文踩的坑）：输入区可能**大到无处可躲**——
+---   Word / Pages / 浏览器的正文区能占满整个窗口高度，贴顶和贴底都会压到它。
+---   拿这种整页矩形去比重叠只会得到「顶部重叠略小」这种假信号，把键盘抬到
+---   顶部照样盖着文档，比贴底还糟。所以识别出「大容器」时一律保持贴底，
+---   不凭模糊信息乱动。
 ---   位置只在 show 时算一次；之后手动拖动的位置一直有效，直到下次收起再打开。
 ---
 --- 已知边界：
@@ -398,7 +405,112 @@ end
 -- 位置：躲开输入焦点（光标 / 输入框）
 --------------------------------------------------------------------------------
 
---- 取当前输入焦点的屏幕矩形 {x,y,w,h}，拿不到返回 nil。
+--- 诊断日志：/tmp/osk-ax.log。
+--- 「键盘为什么没躲开」在屏幕上完全看不出来（不报错、也没提示），不看日志
+--- 只能猜：到底是 AX 没给出焦点、还是给了但取不到光标矩形、还是矩形太大
+--- 没法避让。所以每次 show 都把探测链路逐条落盘，排查时先看这个文件。
+--- 文件超过 256KB 自动截断，避免长期运行把 /tmp 撑爆。
+local function diag(fmt, ...)
+    local path = "/tmp/osk-ax.log"
+    local f = io.open(path, "r")
+    if f then
+        local size = f:seek("end")
+        f:close()
+        if size > 256 * 1024 then
+            local t = io.open(path, "w")
+            if t then t:close() end
+        end
+    end
+    local out = io.open(path, "a")
+    if not out then return end
+    out:write(string.format("%s  ", os.date("%F %T")), string.format(fmt, ...), "\n")
+    out:close()
+end
+
+--- 一次 AX 读取，永不抛异常（AX 权限被撤销、App 半死都会抛）。
+local function axAttr(el, name)
+    if not el then return nil end
+    local ok, v = pcall(function() return el:attributeValue(name) end)
+    if ok then return v end
+    return nil
+end
+
+--- 带参数的 AX 读取（AXBoundsForRange 走这里），同样不抛。
+local function axParam(el, name, param)
+    if not el then return nil end
+    local ok, v = pcall(function() return el:parameterizedAttributeValue(name, param) end)
+    if ok then return v end
+    return nil
+end
+
+--- 矩形是否可用（x/y 必须是数字，w/h 缺省当 0）。
+local function validRect(r)
+    return type(r) == "table"
+        and tonumber(r.x) ~= nil and tonumber(r.y) ~= nil
+        and tonumber(r.w or 0) ~= nil and tonumber(r.h or 0) ~= nil
+end
+
+local function rectOf(b)
+    if not validRect(b) then return nil end
+    return { x = b.x, y = b.y, w = b.w or 0, h = b.h or 0 }
+end
+
+--- 在一个 AX 元素上取矩形，逐级降级，结果塞进 out（带来源标注）：
+---   ① AXSelectedTextRange  + AXBoundsForRange → 插入光标那条细线（精确）
+---   ② AXSelectedTextRanges（复数）→ 有些 App 只给这个；取最后一个，
+---      因为插入点永远在选区末端
+---   ③ AXPosition + AXSize → 整个输入框 / 容器（不精确，只能当粗判据）
+--- range 参数写成 {location=, length=}，dylib 会转成 kAXValueCFRangeType
+--- （写 {starts=, ends=} 也认）。
+--- 在一个元素上做三级降级探测，把找到的矩形塞进 out。
+--- 返回值只表示「**这个元素有没有给出候选**」，不区分精确还是粗判据——
+--- 调用方据此决定还要不要往更外围的路子（子层/父层/App 元素）上找。
+--- 精确优先由 focusedInputInfo 在所有候选里统一排。
+---
+--- 注意：拿到 box（粗判据）时也必须返回 true。早先这里返回 false，导致
+--- focusedInputInfo 以为「还没找到」而继续走 App 元素兜底；那条路在真实环境里
+--- 常能返回一个看似精确的光标框，于是整页容器的「两边都躲不开 → 保持贴底」
+--- 判定被它盖掉，把键盘抬到顶部、照样盖着正文（2026-10-02 Word 那个 bug）。
+local function probeElement(el, label, out)
+    if not el then return false end
+
+    local range = axAttr(el, "AXSelectedTextRange")
+    if type(range) == "table" and tonumber(range.location) then
+        local b = rectOf(axParam(el, "AXBoundsForRange", range))
+        if b then
+            out[#out + 1] = { src = label .. "/range", rect = b, precise = true }
+            return true
+        end
+    end
+
+    local rs = axAttr(el, "AXSelectedTextRanges")
+    if type(rs) == "table" and #rs > 0 then
+        for i = #rs, 1, -1 do
+            local r = rs[i]
+            if type(r) == "table" and tonumber(r.location) then
+                local b = rectOf(axParam(el, "AXBoundsForRange", r))
+                if b then
+                    out[#out + 1] = { src = label .. "/ranges", rect = b, precise = true }
+                    return true
+                end
+            end
+        end
+    end
+
+    local pos  = axAttr(el, "AXPosition")
+    local size = axAttr(el, "AXSize")
+    if type(pos) == "table" and type(size) == "table" then
+        local b = rectOf({ x = pos.x, y = pos.y, w = size.w, h = size.h })
+        if b then
+            out[#out + 1] = { src = label .. "/box", rect = b, precise = false }
+            return true
+        end
+    end
+    return false
+end
+
+--- 取当前输入焦点的矩形信息。
+--- 返回 { rect = {x,y,w,h}, precise = bool, src = string } 或 nil。
 ---
 --- 坐标系：AX 返回的是**左上原点、y 向下**的全局坐标，与 hs.screen:frame() /
 --- hs.canvas 对 Lua 暴露的坐标是**同一套**，直接用，不要翻转。
@@ -408,17 +520,20 @@ end
 --- 这里若自作主张翻转，会把面板送到屏幕另一头，性质和 2026-09-26 那次
 --- 「把点击镜像打空」完全一样。
 ---
---- 两级取法，逐级降级：
----   1. AXSelectedTextRange + AXBoundsForRange → 精确到插入光标（一条细线）；
----      parameterizedAttributeValue 的 range 参数要写成 {location=, length=}，
----      源码里会转成 kAXValueCFRangeType（写成 {starts=,ends=} 也行）。
----   2. AXPosition + AXSize → 退而求其次，整个输入框 / 文本框。
---- 全拿不到（没 AX 权限、App 不支持 AX、焦点不在文本框）→ nil，调用方退回
+--- 探测路径（拿到精确光标就立刻停手，不做无用功）：
+---   1. systemWide 的 AXFocusedUIElement —— 覆盖绝大多数 App
+---   2. 焦点元素自己的子层 —— Word / Pages 这类正文外面裹一层滚动容器的，
+---      焦点挂在壳上，文本区在下一层
+---   3. 焦点元素的父层 —— 少数 App 焦点挂在外壳上、文本区是它的兄弟或父
+---   4. 前台 App 元素的 AXFocusedWindow → AXFocusedUIElement —— 另一条
+---      取焦点的路，systemWide 拿不到时兜底
+--- 全部拿不到（没 AX 权限、App 不支持 AX、焦点不在文本框）→ nil，调用方退回
 --- 默认贴底，绝不因为 AX 失败就让键盘显示不出来。
-local function focusedInputRect()
-    local ok, r = pcall(function()
+local function focusedInputInfo()
+    local out = {}
+    local ok = pcall(function()
         local sw = hs.axuielement.systemWideElement()
-        if not sw then return nil end
+        if not sw then diag("systemWideElement() = nil"); return end
 
         -- 给 AX 查询装上超时闸。默认超时很长（数秒），前台 App 卡住时
         -- M.show() 会被一起拖住、键盘迟迟出不来。
@@ -429,28 +544,51 @@ local function focusedInputRect()
             M._axTimeoutSet = true
         end
 
-        local el = sw:attributeValue("AXFocusedUIElement")
-        if not el then return nil end
+        local el = axAttr(sw, "AXFocusedUIElement")
+        if not el then diag("AXFocusedUIElement = nil（焦点不在文本框，或 App 无 AX）") return end
+        diag("焦点元素 role=%s", tostring(axAttr(el, "AXRole")))
 
-        local range = el:attributeValue("AXSelectedTextRange")
-        if type(range) == "table" and tonumber(range.location) then
-            local b = el:parameterizedAttributeValue("AXBoundsForRange", range)
-            if type(b) == "table" and tonumber(b.x) and tonumber(b.y) then
-                return { x = b.x, y = b.y, w = b.w or 0, h = b.h or 0 }
+        -- 四条路径不是「谁先有结果谁赢」，而是**按权威性分层收集，最后统一排序**：
+        --   焦点元素 > 子层 > 父层 > App 元素（兜底）
+        -- 焦点元素/子层/父层是同一个来源（当前焦点那条链），子层里的**精确光标**
+        -- 比焦点元素给的**整页容器**更有信息量，所以就算焦点元素已经给出了矩形，
+        -- 也要继续往下找光标。
+        -- 只有 App 元素那条路是**另一个来源**，权威性最低，必须等前面全都没结果
+        -- 才用——早先无条件走它，曾把 Word 正文的整页容器判定顶掉（见 probeElement 说明）。
+        probeElement(el, "focus", out)
+
+        local kids = axAttr(el, "AXChildren")
+        if type(kids) == "table" then
+            for i = 1, math.min(#kids, 8) do
+                probeElement(kids[i], "child" .. i, out)
             end
         end
 
-        local pos  = el:attributeValue("AXPosition")
-        local size = el:attributeValue("AXSize")
-        if type(pos) == "table" and tonumber(pos.x) and tonumber(pos.y)
-            and type(size) == "table" and tonumber(size.w) and tonumber(size.h) then
-            return { x = pos.x, y = pos.y, w = size.w, h = size.h }
+        probeElement(axAttr(el, "AXParent"), "parent", out)
+
+        if #out == 0 then
+            local app = hs.axuielement.applicationElement
+            if app then
+                local okApp, appEl = pcall(app)
+                if okApp and appEl then
+                    local win = axAttr(appEl, "AXFocusedWindow")
+                    local el2 = win and axAttr(win, "AXFocusedUIElement")
+                    if el2 and el2 ~= el then probeElement(el2, "app", out) end
+                end
+            end
         end
-        return nil
     end)
-    if not ok or type(r) ~= "table" then return nil end
-    if not (tonumber(r.x) and tonumber(r.y)) then return nil end
-    return r
+    if not ok then diag("AX 探测抛异常（权限被撤销？）") return nil end
+    if #out == 0 then diag("四条路径都没拿到矩形") return nil end
+
+    for _, c in ipairs(out) do
+        diag("  候选 %-14s %s (%.0f,%.0f %.0fx%.0f)", c.src,
+            c.precise and "光标" or "容器",
+            c.rect.x, c.rect.y, c.rect.w, c.rect.h)
+    end
+    -- 精确（插入光标）优先于粗判据（整个容器）
+    for _, c in ipairs(out) do if c.precise then return c end end
+    return out[1]
 end
 
 --- 面板顶边放在 py 时，与输入区在竖直方向的重叠高度。
@@ -464,14 +602,34 @@ local function vOverlap(caret, py, ph)
     return math.max(0, bot - top)
 end
 
+--- 这个矩形是不是「大到没法避让」。
+--- Word / Pages / 浏览器的正文区能占满整个窗口高度，这时贴顶和贴底都会压到它
+--- ——2026-10-02 之前就是栽在这里：拿整页矩形去比重叠，顶部 321 < 底部 347，
+--- 结果把键盘抬到顶部，照样盖着文档，比贴底还糟。所以宁可不动。
+local function unavoidablyLarge(rect, ph)
+    return (rect.h or 0) > ph * 1.5
+end
+
 --- 选面板左上角。默认贴底（原有行为）；输入区压在下半屏时翻到顶部。
---- 两边重叠都为 0（输入区在屏幕中段）时保持贴底，避免键盘位置神出鬼没。
-local function choosePosition(frame, w, h, caret)
+---
+--- 规则按「拿到的信息有多精确」分档：
+---   * 精确光标（precise）→ 比重叠，轻的一侧。重叠都为 0 时保持贴底。
+---   * 只是个大容器、贴顶贴底都会压到 → **保持贴底**，不凭模糊信息乱动。
+---     这种情况下真正的解法不是挪键盘，而是缩短输入区或换个滚动位置。
+---   * 容器不算大 → 仍按比重叠处理（聊天框、搜索框、终端输入行这类）。
+local function choosePosition(frame, w, h, info)
     local m       = M.edgeMargin
     local x       = frame.x + (frame.w - w) / 2
     local yBottom = frame.y + frame.h - h - m
     local yTop    = frame.y + m
-    if not (M.avoidInput and caret) then return x, yBottom end
+    if not (M.avoidInput and info) then return x, yBottom end
+
+    local caret = info.rect
+    if not info.precise and unavoidablyLarge(caret, h) then
+        diag("输入区是整页容器（h=%.0f vs 面板 %.0f），两边都躲不开 → 保持贴底",
+            caret.h or 0, h)
+        return x, yBottom
+    end
     if vOverlap(caret, yTop, h) < vOverlap(caret, yBottom, h) then return x, yTop end
     return x, yBottom
 end
@@ -608,30 +766,31 @@ function M.show()
 
     -- 躲开输入焦点：优先用光标所在的细条，拿不到就用整个输入框。
     -- 输入区不在键盘这块屏幕上时不做避让 —— 两套屏幕的坐标混用会算错位置。
-    local caret = nil
+    local info = nil
     if M.avoidInput then
-        caret = focusedInputRect()
-        if caret then
-            local cx = caret.x + caret.w / 2
-            local cy = caret.y + caret.h / 2
+        info = focusedInputInfo()
+        if info then
+            local r  = info.rect
+            local cx = r.x + r.w / 2
+            local cy = r.y + r.h / 2
             if cx < f.x or cx > f.x + f.w or cy < f.y or cy > f.y + f.h then
-                caret = nil
+                diag("输入区不在主屏上 → 不做避让")
+                info = nil
             end
         end
     end
-    local x, y = choosePosition(f, w, h, caret)
+    local x, y = choosePosition(f, w, h, info)
 
     if M.debugLog then
-        local lg = io.open("/tmp/osk-debug.log", "a")
-        if lg then
-            lg:write(string.format(
-                "%s show: caret=%s -> panel=(%.0f,%.0f) screen=%s\n",
-                os.date("%T"),
-                caret and string.format("%.0f,%.0f %.0fx%.0f", caret.x, caret.y, caret.w, caret.h) or "nil",
-                x, y, string.format("%.0f,%.0f %.0fx%.0f", f.x, f.y, f.w, f.h)))
-            lg:close()
-        end
+        diag("show: %s -> panel=(%.0f,%.0f) screen=%s",
+            info and string.format("%s %.0f,%.0f %.0fx%.0f", info.src,
+                info.rect.x, info.rect.y, info.rect.w, info.rect.h) or "无输入焦点信息",
+            x, y, string.format("%.0f,%.0f %.0fx%.0f", f.x, f.y, f.w, f.h))
     end
+    diag("show -> panel=(%.0f,%.0f) %s", x, y,
+        info and string.format("依据 %s %s", info.src,
+            info.precise and "(精确光标)" or "(容器粗判)")
+            or "无输入焦点信息 → 默认贴底")
 
     build(x, y)
     M._canvas:show()
