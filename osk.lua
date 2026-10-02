@@ -500,14 +500,19 @@ for _, r in ipairs(TEXT_ROLES) do TEXT_ROLE_SET[r] = true end
 
 --- 把当前焦点窗口的 AX 树整棵 dump 到 /tmp/osk-axtree.log。
 ---
---- 为什么需要它：2026-10-02 这次避让连挂两轮——第一轮误判成「Word 正文躲不开」，
+--- 为什么需要它：2026-10-02 这次避让连挂三轮——第一轮误判成「Word 正文躲不开」，
 --- 第二轮发现 WorkBuddy 里 AXFocusedUIElement 恒为 nil、但按 role 找还是
---- **命中 0 个**。到这一步就只能看真实 AX 树长什么样，继续猜 role / 猜深度
---- 全是盲猜。这函数就是用来终结盲猜的：跑一次，role 列表和层级一清二楚。
+--- **命中 0 个**；第三轮半透明做出来了，位置依然不对，日志仍是「命中 0 个」。
+--- 到这一步就只能看真实 AX 树长什么样，继续猜 role / 猜深度全是盲猜。
 ---
---- 用法：在 Hammerspoon 控制台执行 `hs.osk.dumpAXTree()`。
---- 输出形如「深度 2  AXGroup  3 个  (0,90 1440x810)」，并对带矩形且角色像
---- 输入区的节点额外标出。把 log 发出来就能据此定 role 和深度上限。
+--- **本函数已被自动触发**（见 focusedInputInfo 里的自动 dump）：A2 命中 0 个
+--- 时会自动跑一次并落盘，不需要手动执行。只有想随时看时才手动跑
+--- `hs.osk.dumpAXTree()`。
+---
+--- 除了 role 与层级，还记**每个节点能不能给出 AXSelectedTextRange**——
+--- 这条判据比 role 名字更本质：只要一个元素能返回文本选区，它就是可编辑文本区，
+--- 哪怕它的 role 是 `AXGroup` 或别的怪名字。role 白名单靠不住时（Electron 的
+--- role 会随版本变），它能兜住。
 function M.dumpAXTree()
     local app = hs.application.frontmostApplication()
     if not app then diag("dumpAXTree: 没有前台 App"); return end
@@ -527,6 +532,9 @@ function M.dumpAXTree()
         os.date("%F %T"), win:title(), app:name()))
 
     local counts, layers = {}, {}
+    -- 「能返回文本选区」的节点清单。这是 role 白名单之外的第二条判据，
+    -- 也是判断「这个 App 到底把输入框暴露成什么」最直接的证据。
+    local selHits = {}
     local function walk(el, depth, pathStr)
         if depth > 8 or counts.total > 400 then return end
         counts.total = (counts.total or 0) + 1
@@ -535,16 +543,27 @@ function M.dumpAXTree()
         layers[depth] = layers[depth] or 0
         layers[depth] = layers[depth] + 1
 
+        -- 能不能给出文本选区？能 → 它就是可编辑文本区（不管 role 叫什么）
+        local sel = axAttr(el, "AXSelectedTextRange")
+            or axAttr(el, "AXSelectedTextRanges")
+        local flag = ""
+        if sel ~= nil then
+            flag = "  <<< 可编辑(有选区)"
+            selHits[#selHits + 1] = string.format("%s%s  depth=%d",
+                pathStr, role, depth)
+        elseif TEXT_ROLE_SET[role] then
+            flag = "  <<< 文本 role"
+        end
+
         -- 有矩形的节点才可能是输入区，记下来
         local pos  = axAttr(el, "AXPosition")
         local size = axAttr(el, "AXSize")
         if type(pos) == "table" and type(size) == "table"
             and pos.x and pos.y and size.w and size.h then
-            local flag = TEXT_ROLE_SET[role] and "  <<< 文本 role" or ""
-            f:write(string.format("%s%s%s  (%.0f,%.0f %.0fx%.0f)%s\n",
-                pathStr, role, flag, pos.x, pos.y, size.w, size.h, flag))
+            f:write(string.format("%s%s  (%.0f,%.0f %.0fx%.0f)%s\n",
+                pathStr, role, pos.x, pos.y, size.w, size.h, flag))
         else
-            f:write(string.format("%s%s\n", pathStr, role))
+            f:write(string.format("%s%s%s\n", pathStr, role, flag))
         end
 
         local kids = axAttr(el, "AXChildren")
@@ -555,6 +574,14 @@ function M.dumpAXTree()
         end
     end
     walk(winEl, 0, "")
+
+    if #selHits > 0 then
+        f:write("\n--- 能返回文本选区的节点（= 真正的可编辑文本区）---\n")
+        for _, l in ipairs(selHits) do f:write(l .. "\n") end
+    else
+        f:write("\n--- 能返回文本选区的节点：**一个都没有**---\n")
+        f:write("(说明这个 App/窗口压根没把可编辑区暴露给 AX)\n")
+    end
 
     f:write("\n--- 各深度节点数 ---\n")
     for d = 0, 8 do
@@ -729,58 +756,78 @@ local function focusedInputInfo(frontApp)
         if win then
             local okW, winEl = pcall(hs.axuielement.windowElement, win)
             if okW and winEl then
-local layer = { winEl }
-            local found = 0
-            for depth = 0, MAX_TEXT_DEPTH do
-                -- 先把整层扫一遍，分成「可编辑文本区」和「不是」两类。
-                -- 这么分的理由（踩过）：逐元素处理时，同层里命中的元素虽然不下降，
-                -- 但**同层其它未命中的元素照样会往下降**——Chromium 那种
-                -- 「输入框外面还挂着一堆兄弟容器」的结构里，照样会挖到坏候选。
-                -- 整层判定才能保证「这层有输入框，就不再往下钻」。
-                local hits, rest = {}, {}
-                for _, el in ipairs(layer) do
-                    local role = axAttr(el, "AXRole")
-                    if role and TEXT_ROLE_SET[role] then
-                        hits[#hits + 1] = { el = el, role = role }
-                    else
-                        rest[#rest + 1] = el
-                    end
-                end
-
-                if #hits > 0 then
-                    for _, h in ipairs(hits) do
-                        if found >= MAX_TEXT_NODES then break end
-                        found = found + 1
-                        -- 标签带深度，日志能直接看出它埋在哪一层
-                        probe(h.el, string.format("d%d.%s",
-                            depth, (h.role:gsub("^AX", ""))))
-                    end
-                    diag("A2 第 %d 层命中 %d 个文本元素，就此停住不再下钻", depth, #hits)
-                    break
-                end
-
-                -- 本层没有输入区，才下降一层；累计节点数设上限——
-                -- AX 查询每次都是 IPC，不能把整棵 AX 树走穿。
-                local nextLayer = {}
-                for _, el in ipairs(rest) do
-                    if #nextLayer >= MAX_TEXT_NODES then break end
-                    local kids = axAttr(el, "AXChildren")
-                    if type(kids) == "table" then
-                        for i = 1, #kids do
-                            if #nextLayer >= MAX_TEXT_NODES then break end
-                            nextLayer[#nextLayer + 1] = kids[i]
+                local layer = { winEl }
+                local found = 0
+                for depth = 0, MAX_TEXT_DEPTH do
+                    -- 先把整层扫一遍，分成「可编辑文本区」和「不是」两类。
+                    -- 这么分的理由（踩过）：逐元素处理时，同层里命中的元素虽然不下降，
+                    -- 但**同层其它未命中的元素照样会往下降**——Chromium 那种
+                    -- 「输入框外面还挂着一堆兄弟容器」的结构里，照样会挖到坏候选。
+                    -- 整层判定才能保证「这层有输入框，就不再往下钻」。
+                    local hits, rest = {}, {}
+                    for _, el in ipairs(layer) do
+                        local role = axAttr(el, "AXRole")
+                        -- 判据1：role 在白名单里。
+                        -- 判据2：**能返回文本选区**。这条比 role 名字更本质——
+                        -- 只要元素能给出 AXSelectedTextRange，它就是可编辑文本区，
+                        -- 哪怕 role 是 AXGroup 或别的怪名字（Electron 的 role 会随版本
+                        -- 变，白名单早晚会对不上）。两条任一成立就算命中。
+                        local sel = nil
+                        if not (role and TEXT_ROLE_SET[role]) then
+                            sel = axAttr(el, "AXSelectedTextRange")
+                            if sel == nil then sel = axAttr(el, "AXSelectedTextRanges") end
+                        end
+                        if (role and TEXT_ROLE_SET[role]) or sel ~= nil then
+                            hits[#hits + 1] = { el = el, role = role or "?" }
+                        else
+                            rest[#rest + 1] = el
                         end
                     end
+
+                    if #hits > 0 then
+                        for _, h in ipairs(hits) do
+                            if found >= MAX_TEXT_NODES then break end
+                            found = found + 1
+                            -- 标签带深度，日志能直接看出它埋在哪一层
+                            probe(h.el, string.format("d%d.%s",
+                                depth, (h.role:gsub("^AX", ""))))
+                        end
+                        diag("A2 第 %d 层命中 %d 个文本元素，就此停住不再下钻", depth, #hits)
+                        break
+                    end
+
+                    -- 本层没有输入区，才下降一层；累计节点数设上限——
+                    -- AX 查询每次都是 IPC，不能把整棵 AX 树走穿。
+                    local nextLayer = {}
+                    for _, el in ipairs(rest) do
+                        if #nextLayer >= MAX_TEXT_NODES then break end
+                        local kids = axAttr(el, "AXChildren")
+                        if type(kids) == "table" then
+                            for i = 1, #kids do
+                                if #nextLayer >= MAX_TEXT_NODES then break end
+                                nextLayer[#nextLayer + 1] = kids[i]
+                            end
+                        end
+                    end
+                    if #nextLayer == 0 then break end
+                    layer = nextLayer
                 end
-                if #nextLayer == 0 then break end
-                layer = nextLayer
-            end
-            diag("A2 文本元素命中 %d 个", found)
+                diag("A2 文本元素命中 %d 个", found)
+                -- 命中 0 个说明这个 App 的输入区压根没被 role 白名单捞到。
+                -- 与其继续猜 role，不如直接把真实 AX 树落盘（自动诊断，
+                -- 别指望用户记得手动跑）。只对同一个 App 自动跑一次，否则
+                -- 每次开键盘都 dump 一次会拖慢启动。
+                if found == 0 then
+                    local appName = frontApp and frontApp:name() or "?"
+                    if M._dumpedFor ~= appName then
+                        M._dumpedFor = appName
+                        pcall(M.dumpAXTree)
+                    end
+                end
             else
                 diag("A2 windowElement() 拿不到")
             end
         end
-
 
         -- A3：App 元素 → AXFocusedWindow → AXFocusedUIElement
         -- 注意 applicationElement 是 **Constructor，必须传 hs.application 对象**。
