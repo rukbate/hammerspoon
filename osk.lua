@@ -20,16 +20,18 @@
 ---   激活 Hammerspoon —— show 后立即 + 延迟三次把焦点还给打开前的目标 App。
 ---   点击按键阶段不再有任何焦点操作。
 ---
---- 位置：默认贴屏幕底边居中；`M.avoidInput = true` 时会先看一眼当前输入焦点
----   （AX 取插入光标，退化到输入框），输入区压在下半屏就把键盘翻到顶部，
----   免得挡住正在看的那行字。AX 拿不到就静默退回贴底，不影响显示。
----   每次 show 的探测过程都写 /tmp/osk-ax.log ——「为什么没躲开」在屏幕上完全
+--- 位置：默认贴屏幕底边居中；`M.avoidInput = true` 时先定位当前输入区
+---   （AX），把面板顶边贴到它的**下缘之下**——只是往上挪开输入框焦点，
+---   **不翻到屏幕顶部**（那样会挡住上方对话）。下方空间不够时才顶到屏幕上沿。
+---   AX 拿不到就静默退回贴底，不影响显示。
+---   每次 show 的探测过程都写 /tmp/osk-ax.log——「为什么没躲开」在屏幕上完全
 ---   看不出来（不报错也没提示），排查只能看它。
----   注意（2026-10-02，Word 正文踩的坑）：输入区可能**大到无处可躲**——
----   Word / Pages / 浏览器的正文区能占满整个窗口高度，贴顶和贴底都会压到它。
----   拿这种整页矩形去比重叠只会得到「顶部重叠略小」这种假信号，把键盘抬到
----   顶部照样盖着文档，比贴底还糟。所以识别出「大容器」时一律保持贴底，
----   不凭模糊信息乱动。
+---   两个真机教训（2026-10-02，都是先诊断错、后修对）：
+---   ① WorkBuddy（Electron/Chromium）里 **AXFocusedUIElement 恒为 nil**，
+---      三条焦点链路全军覆没 → 改用「取焦点窗口 → 按 role 找文本元素」。
+---   ② 输入区可能**大到无处可躲**（Word/Pages 正文占满窗口高度）：拿整页矩形
+---      去比对重叠只会得到「顶部重叠略小」这种假信号，把键盘抬到顶部照样
+---      盖着文档。所以**只在拿不到精确光标时**才认输保持贴底，不凭模糊信息乱动。
 ---   位置只在 show 时算一次；之后手动拖动的位置一直有效，直到下次收起再打开。
 ---
 --- 已知边界：
@@ -443,6 +445,21 @@ local function axParam(el, name, param)
     return nil
 end
 
+--- A2「按 role 找输入框」的遍历上限。Chromium 会把可编辑区埋好几层，
+--- 但AX 查询不便宜（每个都是一次 IPC），所以深度和累计命中数都设上限，
+--- 免得在一个复杂窗口里把 show() 拖慢。上限内找不到就放弃避让（贴底）。
+local MAX_TEXT_DEPTH = 4
+local MAX_TEXT_NODES = 12
+
+--- 可编辑文本区的 AX role。A2 那条「按 role 找输入框」的路子按这个列表找。
+--- 覆盖原生 App（AXTextField / AXTextArea / AXSecureTextField）与
+--- Chromium/Electron 的两种角色写法（AXTextField、AXTextArea，
+--- 以及少数版本的 AXSearchField / AXComboBox）。
+local TEXT_ROLES = {
+    "AXTextField", "AXTextArea", "AXSecureTextField",
+    "AXSearchField", "AXComboBox",
+}
+
 --- 矩形是否可用（x/y 必须是数字，w/h 缺省当 0）。
 local function validRect(r)
     return type(r) == "table"
@@ -520,17 +537,38 @@ end
 --- 这里若自作主张翻转，会把面板送到屏幕另一头，性质和 2026-09-26 那次
 --- 「把点击镜像打空」完全一样。
 ---
---- 探测路径（拿到精确光标就立刻停手，不做无用功）：
----   1. systemWide 的 AXFocusedUIElement —— 覆盖绝大多数 App
----   2. 焦点元素自己的子层 —— Word / Pages 这类正文外面裹一层滚动容器的，
----      焦点挂在壳上，文本区在下一层
----   3. 焦点元素的父层 —— 少数 App 焦点挂在外壳上、文本区是它的兄弟或父
----   4. 前台 App 元素的 AXFocusedWindow → AXFocusedUIElement —— 另一条
----      取焦点的路，systemWide 拿不到时兜底
---- 全部拿不到（没 AX 权限、App 不支持 AX、焦点不在文本框）→ nil，调用方退回
+--- 探测分两类，**全部尝试、收集候选、统一排序**（不是谁先有结果谁赢）：
+---   A. 焦点元素链：systemWide 的 AXFocusedUIElement，再从它往下（子层 ≤8）
+---      与往上（父层）各探一次。这三层是同一来源，子层里的**精确光标**比外层的
+---      **整页容器**更有信息量，所以外层给了矩形也要继续往下找。
+---   B. 焦点窗口里的文本元素：拿前台 App 的焦点窗口，按 role 找出其中的
+---      文本框/文本区（见 TEXT_ROLES）。
+---      —— 2026-10-02 真机实测：WorkBuddy（Electron/Chromium）里
+---      **AXFocusedUIElement 恒为 nil**，A 类全军覆没，而输入框明明在窗口里。
+---      Chromium 的 AX 树把可编辑区挂在窗口下、不作为「焦点元素」暴露，
+---      只能按 role 去找。这条路是 Electron 类 App 的主力路径。
+---
+--- 全部拿不到（没AX 权限、App 不支持 AX、焦点不在文本框）→ nil，调用方退回
 --- 默认贴底，绝不因为 AX 失败就让键盘显示不出来。
-local function focusedInputInfo()
+local function focusedInputInfo(frontApp)
     local out = {}
+
+    -- 焦点窗口：A2 要用。frontApp 由调用方传入（它已经取过一遍并排除了
+    -- Hammerspoon 自己），这里不再重复取，免得两处判断不一致。
+    frontApp = frontApp or hs.application.frontmostApplication()
+    local win = nil
+    if frontApp and not isHammerspoon(frontApp) then
+        local okW, w = pcall(function() return frontApp:focusedWindow() end)
+        if okW then win = w end
+        diag("前台 App=%s 焦点窗口=%s",
+            frontApp and frontApp:name() or "?",
+            (win and win:title()) or "nil")
+    end
+
+    local function probe(el, label)
+        if el then probeElement(el, label, out) end
+    end
+
     local ok = pcall(function()
         local sw = hs.axuielement.systemWideElement()
         if not sw then diag("systemWideElement() = nil"); return end
@@ -544,94 +582,161 @@ local function focusedInputInfo()
             M._axTimeoutSet = true
         end
 
+        -- A1：焦点元素 + 子层 + 父层
         local el = axAttr(sw, "AXFocusedUIElement")
-        if not el then diag("AXFocusedUIElement = nil（焦点不在文本框，或 App 无 AX）") return end
-        diag("焦点元素 role=%s", tostring(axAttr(el, "AXRole")))
+        if el then
+            diag("A1 焦点元素 role=%s", tostring(axAttr(el, "AXRole")))
+            probe(el, "focus")
 
-        -- 四条路径不是「谁先有结果谁赢」，而是**按权威性分层收集，最后统一排序**：
-        --   焦点元素 > 子层 > 父层 > App 元素（兜底）
-        -- 焦点元素/子层/父层是同一个来源（当前焦点那条链），子层里的**精确光标**
-        -- 比焦点元素给的**整页容器**更有信息量，所以就算焦点元素已经给出了矩形，
-        -- 也要继续往下找光标。
-        -- 只有 App 元素那条路是**另一个来源**，权威性最低，必须等前面全都没结果
-        -- 才用——早先无条件走它，曾把 Word 正文的整页容器判定顶掉（见 probeElement 说明）。
-        probeElement(el, "focus", out)
+            local kids = axAttr(el, "AXChildren")
+            if type(kids) == "table" then
+                for i = 1, math.min(#kids, 8) do
+                    probe(kids[i], "child" .. i)
+                end
+            end
+            probe(axAttr(el, "AXParent"), "parent")
+        else
+            diag("A1 AXFocusedUIElement = nil（该 App 不把它当焦点元素暴露）")
+        end
 
-        local kids = axAttr(el, "AXChildren")
-        if type(kids) == "table" then
-            for i = 1, math.min(#kids, 8) do
-                probeElement(kids[i], "child" .. i, out)
+        -- A2：焦点窗口的 AX 树里按 role 找文本元素。
+        -- 这是 Electron/Chromium 类 App 的主力路径（2026-10-02 真机坐实）：
+        -- WorkBuddy 里 AXFocusedUIElement 恒为 nil，输入框只出现在窗口的 AX 树里。
+        -- childrenWithRole 只返回**直接子层**，所以按层 BFS 往下挖，深度与累计
+        -- 命中数都设上限——AX 查询每次都是 IPC，不能把整棵 AX 树走穿。
+        if win then
+            local okW, winEl = pcall(hs.axuielement.windowElement, win)
+            if okW and winEl then
+                local roleSet = {}
+                for _, r in ipairs(TEXT_ROLES) do roleSet[r] = true end
+
+                local layer   = { winEl }
+                local found   = 0
+                for depth = 1, MAX_TEXT_DEPTH do
+                    local nextLayer = {}
+                    for _, el in ipairs(layer) do
+                        for _, role in ipairs(TEXT_ROLES) do
+                            local okR, els =
+                                pcall(function() return el:childrenWithRole(role) end)
+                            if okR and type(els) == "table" then
+                                for i = 1, math.min(#els, 3) do
+                                    if found >= MAX_TEXT_NODES then break end
+                                    found = found + 1
+                                    -- 标签里带上深度，日志能直接看出它埋在哪一层
+                                    probe(els[i], string.format("d%d.%s%d",
+                                        depth, (role:gsub("^AX", "")), i))
+                                end
+                            end
+                        end
+                    end
+                    if found >= MAX_TEXT_NODES then break end
+
+                    -- 这一层没文本元素，就把非文本容器收进下一层继续往下
+                    local deeper = 0
+                    for _, el in ipairs(layer) do
+                        local kids = axAttr(el, "AXChildren")
+                        if type(kids) == "table" then
+                            for i = 1, math.min(#kids, MAX_TEXT_NODES) do
+                                local kr = axAttr(kids[i], "AXRole")
+                                if kr and not roleSet[kr] then
+                                    nextLayer[#nextLayer + 1] = kids[i]
+                                    deeper = deeper + 1
+                                end
+                                if #nextLayer >= MAX_TEXT_NODES then break end
+                            end
+                        end
+                        if #nextLayer >= MAX_TEXT_NODES then break end
+                    end
+                    if deeper == 0 then break end   -- 到底了，别再往下
+                    layer = nextLayer
+                end
+                diag("A2 文本元素命中 %d 个", found)
+            else
+                diag("A2 windowElement() 拿不到")
             end
         end
 
-        probeElement(axAttr(el, "AXParent"), "parent", out)
 
-        if #out == 0 then
-            local app = hs.axuielement.applicationElement
-            if app then
-                local okApp, appEl = pcall(app)
-                if okApp and appEl then
-                    local win = axAttr(appEl, "AXFocusedWindow")
-                    local el2 = win and axAttr(win, "AXFocusedUIElement")
-                    if el2 and el2 ~= el then probeElement(el2, "app", out) end
-                end
+        -- A3：App 元素 → AXFocusedWindow → AXFocusedUIElement
+        -- 注意 applicationElement 是 **Constructor，必须传 hs.application 对象**。
+        -- 早先写成无参的 pcall(app) 调用，等于没传 app，这条路从来没通过。
+        if frontApp and not isHammerspoon(frontApp) then
+            local okA, appEl = pcall(hs.axuielement.applicationElement, frontApp)
+            if okA and appEl then
+                local awin = axAttr(appEl, "AXFocusedWindow")
+                probe(awin and axAttr(awin, "AXFocusedUIElement"), "app")
+            else
+                diag("A3 applicationElement() 失败")
             end
         end
     end)
-    if not ok then diag("AX 探测抛异常（权限被撤销？）") return nil end
-    if #out == 0 then diag("四条路径都没拿到矩形") return nil end
+    if not ok then diag("AX 探测抛异常（权限被撤销？）"); return nil end
+    if #out == 0 then diag("所有路径都没拿到矩形"); return nil end
 
     for _, c in ipairs(out) do
         diag("  候选 %-14s %s (%.0f,%.0f %.0fx%.0f)", c.src,
             c.precise and "光标" or "容器",
             c.rect.x, c.rect.y, c.rect.w, c.rect.h)
     end
-    -- 精确（插入光标）优先于粗判据（整个容器）
+    -- 精确（插入光标）优先于粗判据（整个容器）；同精度下先找到的优先
     for _, c in ipairs(out) do if c.precise then return c end end
     return out[1]
 end
 
---- 面板顶边放在 py 时，与输入区在竖直方向的重叠高度。
---- 面板几乎满屏宽，横向必然重叠，所以只看竖直方向。
-local function vOverlap(caret, py, ph)
-    if not caret then return 0 end
-    -- 有些 App 给的插入点高度是 0，按一行文字估一个高度，免得判定永远不重叠
-    local ch = (caret.h and caret.h > 0) and caret.h or 18
-    local top = math.max(py, caret.y)
-    local bot = math.min(py + ph, caret.y + ch)
-    return math.max(0, bot - top)
-end
-
---- 这个矩形是不是「大到没法避让」。
---- Word / Pages / 浏览器的正文区能占满整个窗口高度，这时贴顶和贴底都会压到它
---- ——2026-10-02 之前就是栽在这里：拿整页矩形去比重叠，顶部 321 < 底部 347，
---- 结果把键盘抬到顶部，照样盖着文档，比贴底还糟。所以宁可不动。
+--- 这个矩形是不是「大到无处可躲」。
+--- Word / Pages / 浏览器的正文区能占满整个窗口高度，这时往上挪、贴底都压到它
+--- ——拿整页矩形去比对重叠只会得到「顶部重叠略小」这种假信号，把键盘抬到顶部
+--- 照样盖着文档，比贴底更糟。所以这种情况下认输，保持贴底。
+--- 注意只在**拿不到精确光标**时才认输（调用方保证）；有精确光标时不存在这个问题，
+--- 因为光标那条细线不可能有整页那么高。
 local function unavoidablyLarge(rect, ph)
     return (rect.h or 0) > ph * 1.5
 end
 
---- 选面板左上角。默认贴底（原有行为）；输入区压在下半屏时翻到顶部。
+--- 选面板左上角。
+---
+--- Lin 的要求（2026-10-02）：**只要往上挪开输入框就行，不用翻到屏幕顶部。**
+--- 聊天 App 的输入框通常在窗口底部、离屏幕底边还有一段（工具栏/引用区/状态栏），
+--- 键盘停在输入框下缘之下就够了，既不挡输入、也不挡上方对话。
+--- 所以这里是「精确落位」而不是「顶/底二选一」。
 ---
 --- 规则按「拿到的信息有多精确」分档：
----   * 精确光标（precise）→ 比重叠，轻的一侧。重叠都为 0 时保持贴底。
----   * 只是个大容器、贴顶贴底都会压到 → **保持贴底**，不凭模糊信息乱动。
----     这种情况下真正的解法不是挪键盘，而是缩短输入区或换个滚动位置。
----   * 容器不算大 → 仍按比重叠处理（聊天框、搜索框、终端输入行这类）。
+---   * 有明确下缘（精确光标，或不算大的容器）
+---       → 面板顶边贴在它下缘 + 间距；下方放不下才往上顶_screen 顶。
+---   * 大容器（只有整页矩形、贴顶贴底都躲不开）
+---       → 保持贴底，不凭模糊信息乱动。这种情况下真正的解法不是挪键盘，
+---         而是缩短输入区或换个滚动位置。
 local function choosePosition(frame, w, h, info)
     local m       = M.edgeMargin
     local x       = frame.x + (frame.w - w) / 2
     local yBottom = frame.y + frame.h - h - m
-    local yTop    = frame.y + m
+    local yTop= frame.y + m
     if not (M.avoidInput and info) then return x, yBottom end
 
     local caret = info.rect
+
+    -- 粗判据的大容器：无处可躲，保持贴底
     if not info.precise and unavoidablyLarge(caret, h) then
-        diag("输入区是整页容器（h=%.0f vs 面板 %.0f），两边都躲不开 → 保持贴底",
+        diag("只有整页容器（h=%.0f vs 面板 %.0f），两边都躲不开 → 保持贴底",
             caret.h or 0, h)
         return x, yBottom
     end
-    if vOverlap(caret, yTop, h) < vOverlap(caret, yBottom, h) then return x, yTop end
-    return x, yBottom
+
+    -- 输入区的高度（光标高度为 0 时按一行估）
+    local ch = (caret.h and caret.h > 0) and caret.h or 18
+    local caretBottom = caret.y + ch
+
+    -- 首选：面板顶边贴在输入区下缘之下
+    local y = caretBottom + m
+    if y + h <= frame.y + frame.h - m then
+        diag("精确落位：面板顶边=%.0f（输入区下缘 %.0f + 间距 %d）", y, caretBottom, m)
+        return x, y
+    end
+
+    -- 下方放不下 → 顶到屏幕上沿
+    diag("输入区下缘之下放不下（需要 %.0f，可用 %.0f）→ 顶到屏幕顶部",
+        y + h, frame.y + frame.h - m)
+    return x, yTop
 end
 
 --------------------------------------------------------------------------------
@@ -764,11 +869,12 @@ function M.show()
     local f = hs.screen.mainScreen():frame()
     local w, h = panelSize()
 
-    -- 躲开输入焦点：优先用光标所在的细条，拿不到就用整个输入框。
-    -- 输入区不在键盘这块屏幕上时不做避让 —— 两套屏幕的坐标混用会算错位置。
+    -- 躲开输入区：优先用光标所在的细条，拿不到就用整个输入框/输入区，
+    -- 再拿不到就在焦点窗口里按 role 找（Electron/Chromium 类 App）。
+    -- 输入区不在键盘这块屏幕上时不做避让 —— 两套屏幕坐标混用会算错位置。
     local info = nil
     if M.avoidInput then
-        info = focusedInputInfo()
+        info = focusedInputInfo(M._targetApp)
         if info then
             local r  = info.rect
             local cx = r.x + r.w / 2
