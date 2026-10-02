@@ -72,6 +72,22 @@ M.level       = "assistiveTechHigh" -- 窗口层级：系统辅助面板那一�
 M.avoidInput  = true    -- 显示时躲开输入区：把面板顶边贴到输入区**下缘之下**；
                         -- 下方空间不够才顶到屏幕上沿。拿不到就退回贴底
 M.edgeMargin  = 4       -- 面板与屏幕边缘的间距
+M.useMouse    = true    -- 把**鼠标位置**当作输入区的代理（2026-10-02，Lin 提的思路）。
+                        -- 为什么需要它：为了躲开输入区，前后四轮全在 AX 上打转——猜role、
+                        -- 加白名单、换判据，在 WorkBuddy（Electron）里始终「命中 0 个」。
+                        -- 根本问题是**AX 能不能暴露输入区取决于那个 App 愿不愿意**，
+                        -- 而鼠标位置任何 App 都一定有，一行就拿到、不依赖 App 实现。
+                        -- 用户点输入框那一刻鼠标就在输入区里，所以「鼠标停在哪」
+                        -- 是个很强的代理。
+                        -- 它排在 AX 精确光标之后、粗容器之前（prio 2 vs 1/3）。
+                        -- 设false 可关掉，只用 AX 判定。
+M.mouseStillTime = 0.4  -- 鼠标要**静置**这么久（秒）才采信它的位置。
+                        -- 打开键盘时鼠标可能正在移动，或者刚点完菜单栏就按快捷键——
+                        -- 这时位置是噪声，拿它挪键盘会把面板甩到奇怪的地方。
+M.mouseAnchorHeight = 120 -- 鼠标位置只是个**点**，没有高度，直接拿来跟面板比重叠
+                        -- 毫无意义（点高 0）。所以在它**上方**造一个这么高的
+                        -- 「假想输入区」，只取它的**下缘**：面板停在鼠标上方，
+                        -- 就不会压住用户刚点击的那个位置。
 M.opacity     = 0.78    -- 面板不透明度（1 = 全实心）。Lin 要求半透明
                         -- （2026-10-02）：避让总有兜不住的时候（输入区可能占满
                         -- 整页、或根本探测不到），半透明是最后一道保险——
@@ -477,6 +493,79 @@ local function axParam(el, name, param)
     return nil
 end
 
+--- 鼠标/光标位置 —— **AX 之外的独立来源**（2026-10-02，Lin 提的思路）。
+---
+--- 为什么要有这条：为了躲开输入区，前后四轮全在 AX 上打转——猜 role、加白名单、
+--- 换判据，结果在 WorkBuddy（Electron）里始终「命中 0 个」。**问题在于 AX 能不能
+--- 暴露输入区取决于那个 App 愿不愿意**，而鼠标位置**任何 App 都一定有**，
+--- `hs.mouse.getAbsolutePosition()` 一行就拿到，不依赖权限也不依赖 App 实现。
+---
+--- 用户点输入框那一刻，鼠标就在输入区里。所以「鼠标停在哪」是个**很不错的代理**。
+---
+--- 用法上有两条重要限制（都因为它只是个点，不是矩形）：
+--- * **只在鼠标停留一段时间后采信**。用户打开键盘时鼠标可能正在移动，或者
+---   停在面板外（比如刚点完菜单栏图标就按快捷键）。刚动过的鼠标位置是噪声，
+---   用它挪键盘会把面板甩到奇怪的位置。要「静置」过 `M.mouseStillTime` 秒
+---   才认，否则返回 nil。
+--- * **它只是个点，没有高度**，所以不能直接当容器用（点的高度是 0，
+---   拿去跟面板比重叠毫无意义）。做法是把它当成「输入区的上沿提示」：
+---   在鼠标位置**上方**加一个合理高度，得到一个「假想输入区」矩形，
+---   让它只提供**下缘**这个信息——面板停在鼠标上方就不会压住点击处。
+---   标记为 `precise`（它比整页容器精确得多，比真光标粗但足够用）。
+local function mouseAnchor()
+    if M.avoidInput ~= true then return nil end
+    if M.useMouse == false then return nil end
+    -- **函数名是 `absolutePosition`，不是 `getAbsolutePosition`**（查本机
+    -- docs.json 确认，签名 `hs.mouse.absolutePosition([point]) -> point`，
+    -- 无参即读当前值）。写错名字会被 pcall 静默吞掉、整个功能永不生效——
+    -- 跟 A3 那次 `pcall(app)` 一模一样的坑，所以在这里显式注明。
+    --
+    -- 坐标系：本项目已真机坐实是**左上原点、y 向下**，与 hs.screen:frame() /
+    -- hs.canvas 同一套（见 MEMORY「坐标系」条目），可直接与面板几何比较。
+    local ok, pos = pcall(hs.mouse.absolutePosition)
+    if not ok or type(pos) ~= "table" or not pos.x or not pos.y then
+        diag("鼠标位置读不到（pcall 失败）")
+        return nil
+    end
+    local x, y = pos.x, pos.y
+
+    -- 静置判断：跟上一次记录的位置比，位置没变 + 停够了时间才算「静置」。
+    --
+    -- **时钟必须用 `hs.timer.absoluteTime()`（纳秒单调时钟）**：
+    -- *不能用 `os.time()`* —— 它只到**秒**级精度，而 mouseStillTime 默认 0.4s
+    --  是亚秒阈值。同秒内两次 show 会算出 `now - last.t == 0 < 0.4`，
+    --  静置判定永远不成立（实测踩到：测试里两次 show 挨着跑，
+    --  鼠标候选一次都没生效）。
+    -- *也不能用 `os.clock()`* —— 那是 CPU 时间，空闲时根本不走。
+    -- absoluteTime 还能免疫「系统时间被调整」，比 secondsSinceEpoch 更稳。
+    local now
+    if hs.timer and hs.timer.absoluteTime then
+        local okT, t = pcall(hs.timer.absoluteTime)
+        now = (okT and t) and t / 1e9 or os.time()
+    else
+        now = os.time()
+    end
+    local last = M._mouse
+    local still = false
+    if last and last.x == x and last.y == y then
+        still = (now - last.t) >= (M.mouseStillTime or 0.4)
+    end
+    M._mouse = { x = x, y = y, t = now }
+    if not still then
+        diag("鼠标在动（或刚移动）(%d,%d) → 不用它定位", x, y)
+        return nil
+    end
+
+    -- 点→矩形：在鼠标上方造一个「假想输入区」。
+    -- 高度取 120 是经验值：够覆盖常见输入框（单行/多行几行）的高度，
+    -- 又不会像整页容器那样让避让判断失效。
+    local h = M.mouseAnchorHeight or 120
+    local rect = { x = x - 1, y = y - h, w = 2, h = h }
+    diag("鼠标静置于 (%d,%d) → 假想输入区 (%.0f,%.0f %.0fx%.0f) 下缘 %.0f",
+        x, y, rect.x, rect.y, rect.w, rect.h, rect.y + rect.h)
+    return rect
+end
+
 --- A2「按 role 找输入框」的遍历上限。Chromium 会把可编辑区埋好几层
 --- （实测 WorkBuddy 在第 3 层，但层级会随版本变），深度给到 6 留余量；
 --- 累计节点数也设上限——AX 查询每次都是 IPC，不能把整棵 AX 树走穿。
@@ -634,7 +723,7 @@ local function probeElement(el, label, out)
     if type(range) == "table" and tonumber(range.location) then
         local b = rectOf(axParam(el, "AXBoundsForRange", range))
         if b then
-            out[#out + 1] = { src = label .. "/range", rect = b, precise = true }
+            out[#out + 1] = { src = label .. "/range", rect = b, precise = true, prio = 1 }
             return true
         end
     end
@@ -646,7 +735,7 @@ local function probeElement(el, label, out)
             if type(r) == "table" and tonumber(r.location) then
                 local b = rectOf(axParam(el, "AXBoundsForRange", r))
                 if b then
-                    out[#out + 1] = { src = label .. "/ranges", rect = b, precise = true }
+                    out[#out + 1] = { src = label .. "/ranges", rect = b, precise = true, prio = 1 }
                     return true
                 end
             end
@@ -658,7 +747,12 @@ local function probeElement(el, label, out)
     if type(pos) == "table" and type(size) == "table" then
         local b = rectOf({ x = pos.x, y = pos.y, w = size.w, h = size.h })
         if b then
-            out[#out + 1] = { src = label .. "/box", rect = b, precise = false }
+            -- prio 3 = 粗容器（整个输入框/正文区）。排在 AX 精确光标（1）与
+            -- 鼠标位置（2）之后——「整页容器但子层藏光标」那个场景就靠这个
+            -- 优先级把子层光标选出来。早先这里不设 prio（跟精确候选一样是默认 1），
+            -- 结果整页容器排在子层光标前面，直接把子层光标顶掉了。
+            out[#out + 1] = { src = label .. "/box", rect = b,
+                precise = false, prio = 3 }
             return true
         end
     end
@@ -843,15 +937,33 @@ local function focusedInputInfo(frontApp)
         end
     end)
     if not ok then diag("AX 探测抛异常（权限被撤销？）"); return nil end
+
+    -- A4：鼠标/光标位置。**先加进来**，这样排序时它自然参与竞争：
+    -- 精确光标(prio 1) > 鼠标位置(prio 2) > 粗容器(prio 3)。
+    -- 理由：AX 给的插入光标是真正最准的；找不到时鼠标位置是很强的代理
+    --（用户点输入框那一刻鼠标就在里面），而粗容器只能当兜底。
+    local mrect = mouseAnchor()
+    if mrect then
+        out[#out + 1] = { src = "mouse", rect = mrect,
+            precise = true, prio = 2 }
+    end
+
     if #out == 0 then diag("所有路径都没拿到矩形"); return nil end
 
     for _, c in ipairs(out) do
-        diag("  候选 %-14s %s (%.0f,%.0f %.0fx%.0f)", c.src,
-            c.precise and "光标" or "容器",
+        diag("  候选 %-14s %s (%.0f,%.0f %.0fx%.0f)",
+            c.src, c.precise and "光标" or "容器",
             c.rect.x, c.rect.y, c.rect.w, c.rect.h)
     end
-    -- 精确（插入光标）优先于粗判据（整个容器）；同精度下先找到的优先
-    for _, c in ipairs(out) do if c.precise then return c end end
+    -- 统一排序：prio 小者优先（AX 光标 1 < 鼠标 2 < 粗容器 3）。
+    -- **不用 table.sort**——Lua 的 table.sort 不保证稳定，同 prio 时顺序是未定义的，
+    -- 会出现「有时用鼠标有时用 AX」的随机行为。显式按 idx 兜底即可（稳定排序）。
+    for i, c in ipairs(out) do c.idx = i end
+    table.sort(out, function(a, b)
+        local pa, pb = a.prio or 1, b.prio or 1
+        if pa ~= pb then return pa < pb end
+        return a.idx < b.idx
+    end)
     return out[1]
 end
 

@@ -35,6 +35,10 @@ Lin 的 macOS Hammerspoon 配置。围绕「蓝牙键盘 / 鼠标 / 触控板」
   - 定位分三级：`AXBoundsForRange`（精确光标）→ 复数 `AXSelectedTextRanges` → `AXPosition + AXSize`（整个输入框，粗判据）。多个候选时**精确优先**。
   - 探测路径：**焦点元素**（及其子层 / 父层）→ **焦点窗口的 AX 树里找可编辑区** → App 元素兜底。最后这条是必需的：Electron/Chromium 类App（含 WorkBuddy）里 `AXFocusedUIElement` 恒为 nil，输入框只出现在窗口的 AX 树里。
   - 找可编辑区有**两条判据，任一成立即命中**：① role 在白名单里（`AXTextField` / `AXTextArea` / `AXSecureTextField` / `AXSearchField` / `AXComboBox`）；② **能返回 `AXSelectedTextRange`**。第②条更本质 —— 只要元素能给出文本选区它就是可编辑区，哪怕 role 叫 `AXGroup`。Electron 的 role 会随版本变，光靠白名单早晚会对不上。
+  - **还有一条不依赖 AX 的路：鼠标位置**（`M.useMouse`，默认开）。为了躲开输入区，前后四轮全在 AX 上打转，在 WorkBuddy 里始终「命中 0 个」—— 根本问题是**AX 能不能暴露输入区取决于那个 App 愿不愿意**，而鼠标位置任何 App 都一定有。用户点输入框那一刻鼠标就在里面，所以「鼠标停在哪」是个很强的代理。
+    - 要**静置** `M.mouseStillTime`（0.4s）才采信，否则刚移动过的位置是噪声。
+    - 它只是个**点**，没有高度，直接拿来跟面板比重叠毫无意义。所以在它**上方**造一个 `M.mouseAnchorHeight`（120）高的「假想输入区」，只取**下缘** —— 面板停在鼠标上方就不压住点击处。
+  - 三类来源统一排序，**优先级**：AX 精确光标(1) > 鼠标位置(2) > 粗容器(3)。有真光标时不会被鼠标顶掉。
   - 找到就**整层停止**，不再往命中元素底下挖：Chromium 常把输入框再套一层 wrapper，继续下降只会命中 wrapper 那个「整页大矩形」，反而更糟。
   - **大容器不动**：输入区可能大到无处可躲（Word / Pages / 浏览器的正文区能占满整个窗口高度）。这时认输、保持贴底，不凭模糊信息乱动；真解法是滚动正文让光标挪到上半屏。
   - 探测链路落盘 `/tmp/osk-ax.log`（>256KB 自动截断）：每次 show 记录各路径的候选矩形、最终位置与判断依据。「键盘为什么没躲开」在屏幕上完全看不出来，排查先看它。
