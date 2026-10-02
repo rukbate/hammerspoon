@@ -460,7 +460,27 @@ end
 --- 只能猜：到底是 AX 没给出焦点、还是给了但取不到光标矩形、还是矩形太大
 --- 没法避让。所以每次 show 都把探测链路逐条落盘，排查时先看这个文件。
 --- 文件超过 256KB 自动截断，避免长期运行把 /tmp 撑爆。
+--- **本函数必须对任何参数都绝不抛异常**（2026-10-02 踩到）：
+--- 它原来直接 `string.format(fmt, ...)`，而调用点传进来的坐标**可能带小数**
+--- （`hs.mouse.absolutePosition()` 返回 CGFloat，x/y 可能是 700.5），
+--- `%d` 遇到非整数就报 "number has no integer representation"。
+--- 更糟的是 `mouseAnchor` 是在 `focusedInputInfo` 的 pcall **之外**调用的，
+--- 于是这个「日志用错了格式」直接把 `M.show()` 打断 —— **日志成了故障源**：
+--- 点菜单栏图标打开键盘都失败（2026-10-02 23:12 真机报错，堆栈见日志）。
+---
+--- 现在做两层保护：① 整段 pcall，格式化失败退回「原样拼 fmt + 参数」，
+--- 保证这条诊断信息不丢；② 调用点一律改用 `%.0f` 这类能安全处理浮点的格式符。
+--- 两层都要有——只做①会丢信息，只做②则下次有人再传个奇怪参数又会炸。
 local function diag(fmt, ...)
+    local ok, line = pcall(string.format, fmt, ...)
+    if not ok then
+        local raw = {}
+        for i = 1, select("#", ...) do
+            raw[#raw + 1] = tostring((select(i, ...)))
+        end
+        line = tostring(fmt) .. " (格式化失败, 参数: "
+            .. table.concat(raw, ", ") .. ")"
+    end
     local path = "/tmp/osk-ax.log"
     local f = io.open(path, "r")
     if f then
@@ -473,7 +493,7 @@ local function diag(fmt, ...)
     end
     local out = io.open(path, "a")
     if not out then return end
-    out:write(string.format("%s  ", os.date("%F %T")), string.format(fmt, ...), "\n")
+    out:write(os.date("%F %T"), "  ", line, "\n")
     out:close()
 end
 
@@ -527,7 +547,9 @@ local function mouseAnchor()
         diag("鼠标位置读不到（pcall 失败）")
         return nil
     end
-    local x, y = pos.x, pos.y
+    -- 取整再比较：CGFloat 带小数时，同一个物理位置两次读回可能有 0.5 的差，
+    -- 会被误判成「鼠标在动」，静置判定永远不成立。
+    local x, y = math.floor(pos.x + 0.5), math.floor(pos.y + 0.5)
 
     -- 静置判断：跟上一次记录的位置比，位置没变 + 停够了时间才算「静置」。
     --
@@ -552,7 +574,7 @@ local function mouseAnchor()
     end
     M._mouse = { x = x, y = y, t = now }
     if not still then
-        diag("鼠标在动（或刚移动）(%d,%d) → 不用它定位", x, y)
+        diag("鼠标在动（或刚移动）(%.1f,%.1f) → 不用它定位", x, y)
         return nil
     end
 
@@ -560,8 +582,11 @@ local function mouseAnchor()
     -- 高度取 120 是经验值：够覆盖常见输入框（单行/多行几行）的高度，
     -- 又不会像整页容器那样让避让判断失效。
     local h = M.mouseAnchorHeight or 120
-    local rect = { x = x - 1, y = y - h, w = 2, h = h }
-    diag("鼠标静置于 (%d,%d) → 假想输入区 (%.0f,%.0f %.0fx%.0f) 下缘 %.0f",
+    -- **坐标取整**：鼠标返回的是 CGFloat，可能是 700.5 这种带小数的值。
+    -- 几何量带小数一路传到 M._frame.y，会让「点是否落在面板内」的边界判断
+    -- 出现 0.5px 的模糊带。取整后行为确定，也顺带让日志里的 %d 安全。
+    local rect = { x = math.floor(x) - 1, y = math.floor(y) - h, w = 2, h = h }
+    diag("鼠标静置于 (%.1f,%.1f) → 假想输入区 (%.1f,%.1f %.1fx%.1f) 下缘 %.1f",
         x, y, rect.x, rect.y, rect.w, rect.h, rect.y + rect.h)
     return rect
 end
@@ -942,7 +967,15 @@ local function focusedInputInfo(frontApp)
     -- 精确光标(prio 1) > 鼠标位置(prio 2) > 粗容器(prio 3)。
     -- 理由：AX 给的插入光标是真正最准的；找不到时鼠标位置是很强的代理
     --（用户点输入框那一刻鼠标就在里面），而粗容器只能当兜底。
-    local mrect = mouseAnchor()
+    -- **外面再包一层 pcall**：定位失败顶多是「不避让」，绝不该让键盘显示不出来。
+    -- （2026-10-02 真机踩过：这里原先直接调 mouseAnchor，而它内部一条 diag
+    --  因为 %d 收到带小数的 CGFloat 抛了异常，一路上抛到 M.show() 外面，
+    --  结果点菜单栏图标打开键盘直接失效——日志成了故障源。）
+    local okM, mrect = pcall(mouseAnchor)
+    if not okM then
+        diag("mouseAnchor 抛异常（已忽略，改为不避让）: %s", tostring(mrect))
+        mrect = nil
+    end
     if mrect then
         out[#out + 1] = { src = "mouse", rect = mrect,
             precise = true, prio = 2 }
