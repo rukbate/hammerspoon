@@ -646,9 +646,10 @@ function M.dumpAXTree()
         os.date("%F %T"), win:title(), app:name()))
 
     local counts, layers = {}, {}
-    -- 「能返回文本选区」的节点清单。这是 role 白名单之外的第二条判据，
-    -- 也是判断「这个 App 到底把输入框暴露成什么」最直接的证据。
+    -- 「能对选区给出有面积的矩形」的节点清单（= 真正的可编辑文本区）。
+    -- A2 的判据 2 就是这个口径，这里用同样口径才能直接对照。
     local selHits = {}
+    local emptyHits = {}
     local function walk(el, depth, pathStr)
         if depth > 8 or counts.total > 400 then return end
         counts.total = (counts.total or 0) + 1
@@ -657,16 +658,32 @@ function M.dumpAXTree()
         layers[depth] = layers[depth] or 0
         layers[depth] = layers[depth] + 1
 
-        -- 能不能给出文本选区？能 → 它就是可编辑文本区（不管 role 叫什么）
-        local sel = axAttr(el, "AXSelectedTextRange")
-            or axAttr(el, "AXSelectedTextRanges")
+        -- 能不能**对选区给出有面积的矩形**？能 → 它就是可编辑文本区。
+        -- 注意这里跟 A2 的判据 2 是**同一个口径**：只判「选区非 nil」会把
+        -- Chromium 那堆返回 {location=0,length=0} 空选区的 AXGroup 全算进来
+        -- （真机日志就是这么把一个 0x0 的屏外矩形当成唯一候选的）。
         local flag = ""
-        if sel ~= nil then
-            flag = "  <<< 可编辑(有选区)"
-            selHits[#selHits + 1] = string.format("%s%s  depth=%d",
-                pathStr, role, depth)
-        elseif TEXT_ROLE_SET[role] then
+        if TEXT_ROLE_SET[role] then
             flag = "  <<< 文本 role"
+        else
+            local sel = axAttr(el, "AXSelectedTextRange")
+            if sel == nil then sel = axAttr(el, "AXSelectedTextRanges") end
+            if type(sel) == "table" then
+                local one = sel.location and sel or sel[1]
+                if type(one) == "table" and tonumber(one.location) then
+                    local b = rectOf(axParam(el, "AXBoundsForRange", one))
+                    if b then
+                        flag = "  <<< 可编辑(有面积的选区)"
+                        selHits[#selHits + 1] = string.format(
+                            "%s%s  depth=%d  (%d,%d %dx%d)",
+                            pathStr, role, depth, b.x, b.y, b.w, b.h)
+                    else
+                        flag = "  (空选区，无矩形 → 不是可编辑区)"
+                        emptyHits[#emptyHits + 1] = string.format(
+                            "%s%s  depth=%d", pathStr, role, depth)
+                    end
+                end
+            end
         end
 
         -- 有矩形的节点才可能是输入区，记下来
@@ -690,11 +707,19 @@ function M.dumpAXTree()
     walk(winEl, 0, "")
 
     if #selHits > 0 then
-        f:write("\n--- 能返回文本选区的节点（= 真正的可编辑文本区）---\n")
+        f:write("\n--- 可编辑文本区（能对选区给出有面积的矩形）---\n")
         for _, l in ipairs(selHits) do f:write(l .. "\n") end
     else
-        f:write("\n--- 能返回文本选区的节点：**一个都没有**---\n")
-        f:write("(说明这个 App/窗口压根没把可编辑区暴露给 AX)\n")
+        f:write("\n--- 可编辑文本区（能对选区给出有面积的矩形）：**一个都没有**---\n")
+        f:write("(这个 App/窗口没把可编辑区暴露给 AX，或选区全是空的)\n")
+    end
+    if #emptyHits > 0 then
+        f:write(string.format(
+            "\n--- 有选区但拿不到矩形（判据2 已排除，共 %d 个）---\n",
+            #emptyHits))
+        for i = 1, math.min(#emptyHits, 15) do
+            f:write(emptyHits[i] .. "\n")
+        end
     end
 
     f:write("\n--- 各深度节点数 ---\n")
@@ -714,10 +739,29 @@ function M.dumpAXTree()
 end
 
 --- 矩形是否可用（x/y 必须是数字，w/h 缺省当 0）。
+--- 矩形是否**真的可用**。
+---
+--- 2026-10-02 真机踩坑：这里原来只检查「是数字」，于是
+--- `AXBoundsForRange` 返回的 **`0x0` 空矩形**（x=0 y=1000 w=0 h=0）被当成有效
+--- 候选——而它在屏幕外，紧接着「输入区不在主屏上」把**整个避让关掉**，
+--- 键盘照样压住输入框。日志原文：
+---   候选 d1.Group/range 光标 (0,1000 0x0)
+---   输入区不在主屏上 → 不做避让
+--- 所以必须要求**有面积**。但「有面积」的判据要说准：
+--- * **w>0 且 h>0** —— 正常情况（含细光标 h=0 那种，见下）
+--- * **w 和 h 不能同时为 0** —— 这才是真正没用的空矩形
+---
+--- 注意**不能要求 h>0**：有些 App 给的插入点就是零高度（一条线），
+--- `choosePosition` 里本来就为此做了「高度 0 按一行估高 18」的处理。
+--- 一开始我写成 `w > 0 and h > 0`，把零高度光标也毙了，导致本来能用的
+--- 候选降级掉、面板退回贴底（测试当场抓到）。
 local function validRect(r)
-    return type(r) == "table"
-        and tonumber(r.x) ~= nil and tonumber(r.y) ~= nil
-        and tonumber(r.w or 0) ~= nil and tonumber(r.h or 0) ~= nil
+    if type(r) ~= "table" then return false end
+    local x, y = tonumber(r.x), tonumber(r.y)
+    local w, h = tonumber(r.w or 0), tonumber(r.h or 0)
+    if x == nil or y == nil or w == nil or h == nil then return false end
+    if w < 0 or h < 0 then return false end
+    return (w > 0 and h > 0) or (w > 0 or h > 0)   -- 即：不是 0x0
 end
 
 local function rectOf(b)
@@ -887,16 +931,36 @@ local function focusedInputInfo(frontApp)
                     for _, el in ipairs(layer) do
                         local role = axAttr(el, "AXRole")
                         -- 判据1：role 在白名单里。
-                        -- 判据2：**能返回文本选区**。这条比 role 名字更本质——
-                        -- 只要元素能给出 AXSelectedTextRange，它就是可编辑文本区，
-                        -- 哪怕 role 是 AXGroup 或别的怪名字（Electron 的 role 会随版本
-                        -- 变，白名单早晚会对不上）。两条任一成立就算命中。
-                        local sel = nil
-                        if not (role and TEXT_ROLE_SET[role]) then
-                            sel = axAttr(el, "AXSelectedTextRange")
-                            if sel == nil then sel = axAttr(el, "AXSelectedTextRanges") end
+                        --
+                        -- 判据2：**能对选区给出有面积的矩形**。
+                        --
+                        -- 关键在「有面积」这三个字。2026-10-02 真机踩过：Chromium 里
+                        -- 很多 `AXGroup` 都会返回 `{location=0, length=0}` 这种**空选区**，
+                        -- 只判「AXSelectedTextRange 不是 nil」会把它们全当成可编辑区——
+                        -- 日志原文「A2 第 1 层命中 1 个文本元素」命中的是
+                        -- `d1.Group/range 光标 (0,1000 0x0)`，0x0 且在屏幕外，
+                        -- 紧接着「输入区不在主屏上」把整个避让关掉了。
+                        --
+                        -- 所以判据 2 必须**真的去问 AXBoundsForRange 要矩形**，
+                        -- 并且要求矩形有面积（见 validRect）。空选区拿不到有效矩形，
+                        -- 就当不是可编辑区——继续往下降找真正的输入框。
+                        local byRole = (role and TEXT_ROLE_SET[role]) or false
+                        local bySel = false
+                        if not byRole then
+                            local sel = axAttr(el, "AXSelectedTextRange")
+                            if sel == nil then
+                                sel = axAttr(el, "AXSelectedTextRanges")
+                            end
+                            if type(sel) == "table" then
+                                -- 单数 {location=,length=}；复数是 {{location=,length=},...}
+                                local one = sel.location and sel or sel[1]
+                                if type(one) == "table" and tonumber(one.location) then
+                                    local b = rectOf(axParam(el, "AXBoundsForRange", one))
+                                    bySel = (b ~= nil)
+                                end
+                            end
                         end
-                        if (role and TEXT_ROLE_SET[role]) or sel ~= nil then
+                        if byRole or bySel then
                             hits[#hits + 1] = { el = el, role = role or "?" }
                         else
                             rest[#rest + 1] = el
@@ -987,6 +1051,32 @@ local function focusedInputInfo(frontApp)
         diag("  候选 %-14s %s (%.0f,%.0f %.0fx%.0f)",
             c.src, c.precise and "光标" or "容器",
             c.rect.x, c.rect.y, c.rect.w, c.rect.h)
+    end
+
+    -- **剔除屏幕外的候选**（2026-10-02 真机踩坑）：原来这里只有一个「不在主屏上
+    -- → 整个不做避让」的判断，于是**唯一那个坏候选会把避让整体关掉**——
+    -- 键盘照样压住输入框。日志原文：
+    --   候选 d1.Group/range 光标 (0,1000 0x0)
+    --   输入区不在主屏上 → 不做避让
+    -- 正确做法是**把坏的剔掉、拿剩下的**（鼠标位置那条路往往还在）。
+    local f = hs.screen.mainScreen():frame()
+    local kept = {}
+    for _, c in ipairs(out) do
+        local r = c.rect
+        local cx, cy = r.x + (r.w or 0) / 2, r.y + (r.h or 0) / 2
+        -- 中心点在屏幕内才算。留一点余量：输入框贴着屏幕边时中心可能刚好越界。
+        if cx >= f.x - 1 and cx <= f.x + f.w + 1
+           and cy >= f.y - 1 and cy <= f.y + f.h + 1 then
+            kept[#kept + 1] = c
+        else
+            diag("剔除屏幕外候选 %s (%.0f,%.0f %.0fx%.0f)",
+                c.src, r.x, r.y, r.w or 0, r.h or 0)
+        end
+    end
+    out = kept
+    if #out == 0 then
+        diag("所有候选都在主屏外 → 不做避让")
+        return nil
     end
     -- 统一排序：prio 小者优先（AX 光标 1 < 鼠标 2 < 粗容器 3）。
     -- **不用 table.sort**——Lua 的 table.sort 不保证稳定，同 prio 时顺序是未定义的，
@@ -1223,16 +1313,10 @@ function M.show()
     -- 输入区不在键盘这块屏幕上时不做避让 —— 两套屏幕坐标混用会算错位置。
     local info = nil
     if M.avoidInput then
+        -- 屏幕外的候选已在 focusedInputInfo 里剔除（不剔除的话，
+        -- **唯一一个坏候选会把避让整体关掉**，2026-10-02 真机踩过）。
+        -- 这里不再重复判断，免得同一份坏逻辑二次否决。
         info = focusedInputInfo(M._targetApp)
-        if info then
-            local r  = info.rect
-            local cx = r.x + r.w / 2
-            local cy = r.y + r.h / 2
-            if cx < f.x or cx > f.x + f.w or cy < f.y or cy > f.y + f.h then
-                diag("输入区不在主屏上 → 不做避让")
-                info = nil
-            end
-        end
     end
     local x, y = choosePosition(f, w, h, info)
 
