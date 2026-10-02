@@ -31,6 +31,7 @@ Lin 的 macOS Hammerspoon 配置。围绕「蓝牙键盘 / 鼠标 / 触控板」
 - ANSI 布局 6 行 76 键：F 功能键排（esc 在第一排最左）+ 主键区；⌫ / 方向键按住连发；修饰键 sticky（点一下上膛、作用于下一键）；caps 为纯内部状态。
 - **点击不抢焦点**（v3 根治版）：键盘显示期间挂 session 级 eventtap，凡落在面板内的鼠标事件一律在上游截获丢弃——AppKit 看不见点击，焦点始终留在目标 App，合成按键直达输入框。
 - 面板可拖动（按住顶部把手条 / 键位缝隙拖），`M.scale`（默认 1.4）统一缩放整体尺寸，触摸屏使用友好。拖动越界会被钳制在主屏内，避免面板被拖丢找不回来。
+- **显示时躲开输入焦点**（`M.avoidInput = true`）：打开前用 AX 读当前插入光标的位置（拿不到就退化成整个输入框），输入区压在下半屏就把键盘翻到顶部，免得挡住正在打的那一行。AX 读不到时静默退回默认贴底，不影响显示；光标在另一块屏幕上时不做避让（两套屏幕坐标混用会算错）。
 - 层级 `M.level = "assistiveTechHigh"`，并挂了 application watcher：任何 App 被激活就把面板重新 raise 一次（否则会被 Docker 等全屏窗口盖住）。
 
 ### axkeyboard.lua — 系统「无障碍键盘」开关（备用，未加载）
@@ -108,3 +109,8 @@ Jumpcut 风格的剪贴板管理（基于 victorso 的实现改），`⌘⇧V` �
 - 涉及权限的功能先想 TCC / 代码签名；不要动 `/Applications/Hammerspoon.app` 的 Info.plist（会破坏签名与已有授权）。
 - **写 Hammerspoon 脚本时热键键名一律小写**（`f` / `left` / `right`，不是 `F` / `Left`）。`hs.keycodes.map` 里没有大写项，传大写不可靠。
 - 模块不要往 `_G` 里撒全局变量，一律 `local` + `return M`。
+- **屏幕坐标全是「左上原点、y 向下」**：`hs.screen:frame()`、`hs.canvas`、
+  `hs.window:frame()`、`hs.mouse.getAbsolutePosition()`、`hs.eventtap.event:location()`、
+  AX 的 `AXPosition`/`AXBoundsForRange` 都是这一套，彼此直接比较即可。
+  **任何一处做 y 翻转都是 bug**（依据：`libcanvas.m` 的 `RectWithFlippedYCoordinate`
+  在 Lua 侧 ↔ NS 侧之间做翻转，说明 Lua 侧就是 y 向下那套）。

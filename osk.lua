@@ -20,6 +20,11 @@
 ---   激活 Hammerspoon —— show 后立即 + 延迟三次把焦点还给打开前的目标 App。
 ---   点击按键阶段不再有任何焦点操作。
 ---
+--- 位置：默认贴屏幕底边居中；`M.avoidInput = true` 时会先看一眼当前输入焦点
+---   （AX 取插入光标，退化到输入框），输入区压在下半屏就把键盘翻到顶部，
+---   免得挡住正在看的那行字。AX 拿不到就静默退回贴底，不影响显示。
+---   位置只在 show 时算一次；之后手动拖动的位置一直有效，直到下次收起再打开。
+---
 --- 已知边界：
 ---   - Secure Input 激活的密码框（系统登录窗、密码管理器解锁）会拦合成事件。
 ---   - 直接读 HID 的程序（少数游戏、虚拟机客户机）收不到。
@@ -55,12 +60,16 @@ M._frame = nil          -- 面板屏幕坐标 { x, y, w, h }（eventtap 命中�
 M.debugLog = false      -- 临时诊断（/tmp/osk-debug.log），已核实坐标，默认关
 M.level       = "assistiveTechHigh" -- 窗口层级：系统辅助面板那一档，盖住任何 App 窗口
                         -- 想低调点可改 "overlay" / "floating"（后者会被部分 App 盖住）
+M.avoidInput  = true    -- 显示时躲开输入焦点（光标 / 输入框）：默认贴底，
+                        -- 输入区压在下半屏时自动翻到顶部，别挡住正在看的地方
+M.edgeMargin  = 4       -- 面板与屏幕边缘的间距
 M._repeat = nil         -- 按住连发的定时器
 M._tap = nil            -- 事件拦截 tap
 M._watchdog = nil       -- tap 看门狗（系统禁用后自动重启）
 M._capturing = false    -- 正在按（mouseDown 起到 mouseUp 止，期间事件全吞）
 M._pressing = nil       -- 当前按住的键记录
 M._targetApp = nil      -- show 时记录的目标 App（还原 show 抢走的焦点用）
+M._axTimeoutSet = false -- AX 全局超时是否已设（只设一次，见 focusedInputRect）
 
 --- 布局（ANSI 104 键的可用子集，每行宽度恒为 15 单位）。
 --- 每个键：t=显示文字 k=hs.keycodes 键名 s=shift 层文字 w=宽度(默认1)
@@ -386,6 +395,88 @@ local function restoreFocusOnce()
 end
 
 --------------------------------------------------------------------------------
+-- 位置：躲开输入焦点（光标 / 输入框）
+--------------------------------------------------------------------------------
+
+--- 取当前输入焦点的屏幕矩形 {x,y,w,h}，拿不到返回 nil。
+---
+--- 坐标系：AX 返回的是**左上原点、y 向下**的全局坐标，与 hs.screen:frame() /
+--- hs.canvas 对 Lua 暴露的坐标是**同一套**，直接用，不要翻转。
+--- 依据（本机源码核实，2026-10-02）：libcanvas.m 里 Lua 侧 ↔ NS 侧之间靠
+--- RectWithFlippedYCoordinate 转换，翻转基准是 `[[NSScreen screens][0]
+--- frame].size.height`（主屏高）—— 说明 Lua 侧给的就已经是 y 向下那套。
+--- 这里若自作主张翻转，会把面板送到屏幕另一头，性质和 2026-09-26 那次
+--- 「把点击镜像打空」完全一样。
+---
+--- 两级取法，逐级降级：
+---   1. AXSelectedTextRange + AXBoundsForRange → 精确到插入光标（一条细线）；
+---      parameterizedAttributeValue 的 range 参数要写成 {location=, length=}，
+---      源码里会转成 kAXValueCFRangeType（写成 {starts=,ends=} 也行）。
+---   2. AXPosition + AXSize → 退而求其次，整个输入框 / 文本框。
+--- 全拿不到（没 AX 权限、App 不支持 AX、焦点不在文本框）→ nil，调用方退回
+--- 默认贴底，绝不因为 AX 失败就让键盘显示不出来。
+local function focusedInputRect()
+    local ok, r = pcall(function()
+        local sw = hs.axuielement.systemWideElement()
+        if not sw then return nil end
+
+        -- 给 AX 查询装上超时闸。默认超时很长（数秒），前台 App 卡住时
+        -- M.show() 会被一起拖住、键盘迟迟出不来。
+        -- 注意：在 systemWideElement 上设超时是**进程全局**的（文档原文：
+        -- 影响所有没单独设过超时的元素），所以只设一次。
+        if not M._axTimeoutSet then
+            pcall(function() sw:setTimeout(1.0) end)
+            M._axTimeoutSet = true
+        end
+
+        local el = sw:attributeValue("AXFocusedUIElement")
+        if not el then return nil end
+
+        local range = el:attributeValue("AXSelectedTextRange")
+        if type(range) == "table" and tonumber(range.location) then
+            local b = el:parameterizedAttributeValue("AXBoundsForRange", range)
+            if type(b) == "table" and tonumber(b.x) and tonumber(b.y) then
+                return { x = b.x, y = b.y, w = b.w or 0, h = b.h or 0 }
+            end
+        end
+
+        local pos  = el:attributeValue("AXPosition")
+        local size = el:attributeValue("AXSize")
+        if type(pos) == "table" and tonumber(pos.x) and tonumber(pos.y)
+            and type(size) == "table" and tonumber(size.w) and tonumber(size.h) then
+            return { x = pos.x, y = pos.y, w = size.w, h = size.h }
+        end
+        return nil
+    end)
+    if not ok or type(r) ~= "table" then return nil end
+    if not (tonumber(r.x) and tonumber(r.y)) then return nil end
+    return r
+end
+
+--- 面板顶边放在 py 时，与输入区在竖直方向的重叠高度。
+--- 面板几乎满屏宽，横向必然重叠，所以只看竖直方向。
+local function vOverlap(caret, py, ph)
+    if not caret then return 0 end
+    -- 有些 App 给的插入点高度是 0，按一行文字估一个高度，免得判定永远不重叠
+    local ch = (caret.h and caret.h > 0) and caret.h or 18
+    local top = math.max(py, caret.y)
+    local bot = math.min(py + ph, caret.y + ch)
+    return math.max(0, bot - top)
+end
+
+--- 选面板左上角。默认贴底（原有行为）；输入区压在下半屏时翻到顶部。
+--- 两边重叠都为 0（输入区在屏幕中段）时保持贴底，避免键盘位置神出鬼没。
+local function choosePosition(frame, w, h, caret)
+    local m       = M.edgeMargin
+    local x       = frame.x + (frame.w - w) / 2
+    local yBottom = frame.y + frame.h - h - m
+    local yTop    = frame.y + m
+    if not (M.avoidInput and caret) then return x, yBottom end
+    if vOverlap(caret, yTop, h) < vOverlap(caret, yBottom, h) then return x, yTop end
+    return x, yBottom
+end
+
+--------------------------------------------------------------------------------
 -- 构建 / 开关
 --------------------------------------------------------------------------------
 
@@ -514,8 +605,34 @@ function M.show()
 
     local f = hs.screen.mainScreen():frame()
     local w, h = panelSize()
-    local x = f.x + (f.w - w) / 2
-    local y = f.y + f.h - h - 4
+
+    -- 躲开输入焦点：优先用光标所在的细条，拿不到就用整个输入框。
+    -- 输入区不在键盘这块屏幕上时不做避让 —— 两套屏幕的坐标混用会算错位置。
+    local caret = nil
+    if M.avoidInput then
+        caret = focusedInputRect()
+        if caret then
+            local cx = caret.x + caret.w / 2
+            local cy = caret.y + caret.h / 2
+            if cx < f.x or cx > f.x + f.w or cy < f.y or cy > f.y + f.h then
+                caret = nil
+            end
+        end
+    end
+    local x, y = choosePosition(f, w, h, caret)
+
+    if M.debugLog then
+        local lg = io.open("/tmp/osk-debug.log", "a")
+        if lg then
+            lg:write(string.format(
+                "%s show: caret=%s -> panel=(%.0f,%.0f) screen=%s\n",
+                os.date("%T"),
+                caret and string.format("%.0f,%.0f %.0fx%.0f", caret.x, caret.y, caret.w, caret.h) or "nil",
+                x, y, string.format("%.0f,%.0f %.0fx%.0f", f.x, f.y, f.w, f.h)))
+            lg:close()
+        end
+    end
+
     build(x, y)
     M._canvas:show()
 
