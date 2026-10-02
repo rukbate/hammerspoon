@@ -69,9 +69,16 @@ M._frame = nil          -- 面板屏幕坐标 { x, y, w, h }（eventtap 命中�
 M.debugLog = false      -- 临时诊断（/tmp/osk-debug.log），已核实坐标，默认关
 M.level       = "assistiveTechHigh" -- 窗口层级：系统辅助面板那一档，盖住任何 App 窗口
                         -- 想低调点可改 "overlay" / "floating"（后者会被部分 App 盖住）
-M.avoidInput  = true    -- 显示时躲开输入焦点（光标 / 输入框）：默认贴底，
-                        -- 输入区压在下半屏时自动翻到顶部，别挡住正在看的地方
+M.avoidInput  = true    -- 显示时躲开输入区：把面板顶边贴到输入区**下缘之下**；
+                        -- 下方空间不够才顶到屏幕上沿。拿不到就退回贴底
 M.edgeMargin  = 4       -- 面板与屏幕边缘的间距
+M.opacity     = 0.78    -- 面板不透明度（1 = 全实心）。Lin 要求半透明
+                        -- （2026-10-02）：避让总有兜不住的时候（输入区可能占满
+                        -- 整页、或根本探测不到），半透明是最后一道保险——
+                        -- 挡不死，至少能透出下面的输入框。
+                        -- 0.6~0.8 比较合适；< 0.5 键帽会太透、看不清字。
+                        -- 改完立即生效（不用重载），下一次 M.show() 时应用。
+                        -- 想临时完全不透明：hs.osk.opacity = 1
 M._repeat = nil         -- 按住连发的定时器
 M._tap = nil            -- 事件拦截 tap
 M._watchdog = nil       -- tap 看门狗（系统禁用后自动重启）
@@ -159,15 +166,39 @@ local function rgba(hex, a)
 end
 
 --- 深色半透明面板：浅色/深色系统主题下都可读，靠阴影/描边与背景区分。
-local COLORS = {
-    bg      = rgba("1B1B20", 0.88),
-    key     = rgba("3C3C44", 0.96),
-    modKey  = rgba("2E2E36", 0.96),
-    text    = rgba("E8E8EC", 0.98),
-    armed   = rgba("2E7CF6", 0.98),   -- 修饰键上膛 / caps 开
-    pressed = rgba("585864", 0.98),   -- 按下瞬间
-    handle  = rgba("9A9AA4", 0.65),   -- 拖动把手圆点
-}
+---
+--- 半透明做成**函数**而不是加载时算好的常量：Lin 要求「改屏幕键盘为半透明」
+--- （2026-10-02）——避让在某些 App 里仍会兜不住（输入区可能占满整页、或压根
+--- 找不到），半透明是最后一道保险：挡不死，至少能透出下面的输入框。
+--- 做成函数才能让 `M.opacity` 改完立刻生效（改常量得重载模块）。
+---
+--- **关键：窗口级 alpha 和元素 alpha 是相乘的。**
+--- `M.opacity` 已经通过 `canvas:alpha()` 施加在整个窗口上，元素里的 alpha
+--- 只会**再乘一遍**。所以元素颜色不该也去承担「透明」任务——那会被乘两次，
+--- M.opacity 调到 0.5 时键帽就只剩 0.25，什么都看不清了。
+--- 结论：**透明度只由 M.opacity 一个旋钮负责**，元素颜色只负责「面板内部的
+--- 深浅层次」，因此这里只给很小的响应幅度 + 一个硬下限。
+local function colors()
+    local o = M.opacity or 1
+    -- 键帽不透明度：给 0.62 的下限。即便面板很透，键帽本体仍要有实体感，
+    -- 否则键帽和面板背景糊成一片、看不清键位边界。
+    local capAlpha = math.max(0.62, o)
+    -- 文字是硬下限 0.85：键盘的首要用途是看字认键，文字跟着面板一起淡到
+    -- 0.7 就不好用了。早先写成 0.98*(0.6+0.4*o)，在 o=0.3 时只有 0.706，
+    -- 被自己的测试判为不合格——说明这个下限本来就该是硬的。
+    local textAlpha = math.max(0.85, math.min(1, 0.90 + 0.10 * o))
+    return {
+        -- 背景保持较高不透明度：真正让下面输入框透出来的是窗口级 alpha，
+        -- 背景再自己降一档就过头了（两层相乘）。
+        bg      = rgba("1B1B20", math.max(0.72, 0.88 * o)),
+        key     = rgba("3C3C44", 0.96 * capAlpha),
+        modKey  = rgba("2E2E36", 0.96 * capAlpha),
+        text    = rgba("E8E8EC", textAlpha),
+        armed   = rgba("2E7CF6", 0.98 * capAlpha),  -- 修饰键上膛 / caps 开
+        pressed = rgba("585864", 0.98 * capAlpha),  -- 按下瞬间
+        handle  = rgba("9A9AA4", 0.65 * capAlpha),  -- 拖动把手圆点
+    }
+end
 
 --------------------------------------------------------------------------------
 -- 按键输出
@@ -204,15 +235,16 @@ end
 local function refreshKeycaps()
     local c = M._canvas
     if not c then return end
+    local C = colors()
     for _, k in ipairs(M._keys) do
         local def = k.def
         c:elementAttribute(k.text, "text", labelFor(def))
 
-        local fill = def.mod and COLORS.modKey or COLORS.key
+        local fill = def.mod and C.modKey or C.key
         local on = (def.mod and M.armed[def.mod]) or
             (def.special == "caps" and M.caps)
-        if on then fill = COLORS.armed end
-        if k.pressed then fill = COLORS.pressed end
+        if on then fill = C.armed end
+        if k.pressed then fill = C.pressed end
         c:elementAttribute(k.rect, "fillColor", fill)
     end
 end
@@ -445,11 +477,12 @@ local function axParam(el, name, param)
     return nil
 end
 
---- A2「按 role 找输入框」的遍历上限。Chromium 会把可编辑区埋好几层，
---- 但AX 查询不便宜（每个都是一次 IPC），所以深度和累计命中数都设上限，
---- 免得在一个复杂窗口里把 show() 拖慢。上限内找不到就放弃避让（贴底）。
-local MAX_TEXT_DEPTH = 4
-local MAX_TEXT_NODES = 12
+--- A2「按 role 找输入框」的遍历上限。Chromium 会把可编辑区埋好几层
+--- （实测 WorkBuddy 在第 3 层，但层级会随版本变），深度给到 6 留余量；
+--- 累计节点数也设上限——AX 查询每次都是 IPC，不能把整棵 AX 树走穿。
+--- 想知道真实层级就执行 `hs.osk.dumpAXTree()`，它会打印每层节点数与 role 统计。
+local MAX_TEXT_DEPTH = 6
+local MAX_TEXT_NODES = 24
 
 --- 可编辑文本区的 AX role。A2 那条「按 role 找输入框」的路子按这个列表找。
 --- 覆盖原生 App（AXTextField / AXTextArea / AXSecureTextField）与
@@ -459,6 +492,85 @@ local TEXT_ROLES = {
     "AXTextField", "AXTextArea", "AXSecureTextField",
     "AXSearchField", "AXComboBox",
 }
+
+--- **遇到可编辑 role 就停，不再往下挖**（Chromium 会把文本框再套一层 wrapper，
+--- 继续下降只会命中 wrapper 那个「整页大矩形」，反而更糟）。
+local TEXT_ROLE_SET = {}
+for _, r in ipairs(TEXT_ROLES) do TEXT_ROLE_SET[r] = true end
+
+--- 把当前焦点窗口的 AX 树整棵 dump 到 /tmp/osk-axtree.log。
+---
+--- 为什么需要它：2026-10-02 这次避让连挂两轮——第一轮误判成「Word 正文躲不开」，
+--- 第二轮发现 WorkBuddy 里 AXFocusedUIElement 恒为 nil、但按 role 找还是
+--- **命中 0 个**。到这一步就只能看真实 AX 树长什么样，继续猜 role / 猜深度
+--- 全是盲猜。这函数就是用来终结盲猜的：跑一次，role 列表和层级一清二楚。
+---
+--- 用法：在 Hammerspoon 控制台执行 `hs.osk.dumpAXTree()`。
+--- 输出形如「深度 2  AXGroup  3 个  (0,90 1440x810)」，并对带矩形且角色像
+--- 输入区的节点额外标出。把 log 发出来就能据此定 role 和深度上限。
+function M.dumpAXTree()
+    local app = hs.application.frontmostApplication()
+    if not app then diag("dumpAXTree: 没有前台 App"); return end
+    local okW, win = pcall(function() return app:focusedWindow() end)
+    if not okW or not win then
+        diag("dumpAXTree: %s 没有焦点窗口", app:name()); return
+    end
+    local okE, winEl = pcall(hs.axuielement.windowElement, win)
+    if not okE or not winEl then
+        diag("dumpAXTree: windowElement() 拿不到（%s）", app:name()); return
+    end
+
+    local path = "/tmp/osk-axtree.log"
+    local f = io.open(path, "w")
+    if not f then diag("dumpAXTree: 写不了 %s", path); return end
+    f:write(string.format("=== %s  窗口「%s」  %s ===\n",
+        os.date("%F %T"), win:title(), app:name()))
+
+    local counts, layers = {}, {}
+    local function walk(el, depth, pathStr)
+        if depth > 8 or counts.total > 400 then return end
+        counts.total = (counts.total or 0) + 1
+        local role = axAttr(el, "AXRole") or "?"
+        counts[role] = (counts[role] or 0) + 1
+        layers[depth] = layers[depth] or 0
+        layers[depth] = layers[depth] + 1
+
+        -- 有矩形的节点才可能是输入区，记下来
+        local pos  = axAttr(el, "AXPosition")
+        local size = axAttr(el, "AXSize")
+        if type(pos) == "table" and type(size) == "table"
+            and pos.x and pos.y and size.w and size.h then
+            local flag = TEXT_ROLE_SET[role] and "  <<< 文本 role" or ""
+            f:write(string.format("%s%s%s  (%.0f,%.0f %.0fx%.0f)%s\n",
+                pathStr, role, flag, pos.x, pos.y, size.w, size.h, flag))
+        else
+            f:write(string.format("%s%s\n", pathStr, role))
+        end
+
+        local kids = axAttr(el, "AXChildren")
+        if type(kids) == "table" then
+            for i = 1, math.min(#kids, 30) do
+                walk(kids[i], depth + 1, pathStr .. "  ")
+            end
+        end
+    end
+    walk(winEl, 0, "")
+
+    f:write("\n--- 各深度节点数 ---\n")
+    for d = 0, 8 do
+        if layers[d] then f:write(string.format("深度 %d: %d\n", d, layers[d])) end
+    end
+    f:write("\n--- role 统计 ---\n")
+    local names = {}
+    for r in pairs(counts) do if r ~= "total" then names[#names + 1] = r end end
+    table.sort(names)
+    for _, r in ipairs(names) do
+        f:write(string.format("%-28s %d\n", r, counts[r]))
+    end
+    f:close()
+    diag("dumpAXTree: 已写入 %s（%d 个节点）", path, counts.total or 0)
+    return path
+end
 
 --- 矩形是否可用（x/y 必须是数字，w/h 缺省当 0）。
 local function validRect(r)
@@ -602,55 +714,68 @@ local function focusedInputInfo(frontApp)
         -- A2：焦点窗口的 AX 树里按 role 找文本元素。
         -- 这是 Electron/Chromium 类 App 的主力路径（2026-10-02 真机坐实）：
         -- WorkBuddy 里 AXFocusedUIElement 恒为 nil，输入框只出现在窗口的 AX 树里。
-        -- childrenWithRole 只返回**直接子层**，所以按层 BFS 往下挖，深度与累计
-        -- 命中数都设上限——AX 查询每次都是 IPC，不能把整棵 AX 树走穿。
+        --
+        -- 实现要点（都踩过）：
+        -- * 只查 childrenWithRole 不够——它只返回**直接子层**，而 Chromium 的
+        --   输入框往往埋在第 3 层。所以逐层往下取 AXChildren 自己做 BFS。
+        -- * 命中就是「**整层**有文本 role 就停」，不是「某个元素命中就停」：
+        --   逐元素停的话，同层里其它没命中的容器照样会往下降，照样挖到
+        --   坏候选（Chromium 的输入框外面常挂着一堆兄弟容器）。
+        -- * 停下之后**不再往命中元素底下挖**：Chromium 会把真正的输入框再套
+        --   一层 wrapper，继续下降只会命中 wrapper 那个「整页大矩形」，
+        --   反而更糟（那正是第一轮误判成「输入区占满整页躲不开」的坑）。
+        -- * 深度与累计节点数都设上限——AX 查询每次都是 IPC，不能走穿整棵 AX 树。
+        --   想知道真实层级就执行 `hs.osk.dumpAXTree()`。
         if win then
             local okW, winEl = pcall(hs.axuielement.windowElement, win)
             if okW and winEl then
-                local roleSet = {}
-                for _, r in ipairs(TEXT_ROLES) do roleSet[r] = true end
-
-                local layer   = { winEl }
-                local found   = 0
-                for depth = 1, MAX_TEXT_DEPTH do
-                    local nextLayer = {}
-                    for _, el in ipairs(layer) do
-                        for _, role in ipairs(TEXT_ROLES) do
-                            local okR, els =
-                                pcall(function() return el:childrenWithRole(role) end)
-                            if okR and type(els) == "table" then
-                                for i = 1, math.min(#els, 3) do
-                                    if found >= MAX_TEXT_NODES then break end
-                                    found = found + 1
-                                    -- 标签里带上深度，日志能直接看出它埋在哪一层
-                                    probe(els[i], string.format("d%d.%s%d",
-                                        depth, (role:gsub("^AX", "")), i))
-                                end
-                            end
-                        end
+local layer = { winEl }
+            local found = 0
+            for depth = 0, MAX_TEXT_DEPTH do
+                -- 先把整层扫一遍，分成「可编辑文本区」和「不是」两类。
+                -- 这么分的理由（踩过）：逐元素处理时，同层里命中的元素虽然不下降，
+                -- 但**同层其它未命中的元素照样会往下降**——Chromium 那种
+                -- 「输入框外面还挂着一堆兄弟容器」的结构里，照样会挖到坏候选。
+                -- 整层判定才能保证「这层有输入框，就不再往下钻」。
+                local hits, rest = {}, {}
+                for _, el in ipairs(layer) do
+                    local role = axAttr(el, "AXRole")
+                    if role and TEXT_ROLE_SET[role] then
+                        hits[#hits + 1] = { el = el, role = role }
+                    else
+                        rest[#rest + 1] = el
                     end
-                    if found >= MAX_TEXT_NODES then break end
-
-                    -- 这一层没文本元素，就把非文本容器收进下一层继续往下
-                    local deeper = 0
-                    for _, el in ipairs(layer) do
-                        local kids = axAttr(el, "AXChildren")
-                        if type(kids) == "table" then
-                            for i = 1, math.min(#kids, MAX_TEXT_NODES) do
-                                local kr = axAttr(kids[i], "AXRole")
-                                if kr and not roleSet[kr] then
-                                    nextLayer[#nextLayer + 1] = kids[i]
-                                    deeper = deeper + 1
-                                end
-                                if #nextLayer >= MAX_TEXT_NODES then break end
-                            end
-                        end
-                        if #nextLayer >= MAX_TEXT_NODES then break end
-                    end
-                    if deeper == 0 then break end   -- 到底了，别再往下
-                    layer = nextLayer
                 end
-                diag("A2 文本元素命中 %d 个", found)
+
+                if #hits > 0 then
+                    for _, h in ipairs(hits) do
+                        if found >= MAX_TEXT_NODES then break end
+                        found = found + 1
+                        -- 标签带深度，日志能直接看出它埋在哪一层
+                        probe(h.el, string.format("d%d.%s",
+                            depth, (h.role:gsub("^AX", ""))))
+                    end
+                    diag("A2 第 %d 层命中 %d 个文本元素，就此停住不再下钻", depth, #hits)
+                    break
+                end
+
+                -- 本层没有输入区，才下降一层；累计节点数设上限——
+                -- AX 查询每次都是 IPC，不能把整棵 AX 树走穿。
+                local nextLayer = {}
+                for _, el in ipairs(rest) do
+                    if #nextLayer >= MAX_TEXT_NODES then break end
+                    local kids = axAttr(el, "AXChildren")
+                    if type(kids) == "table" then
+                        for i = 1, #kids do
+                            if #nextLayer >= MAX_TEXT_NODES then break end
+                            nextLayer[#nextLayer + 1] = kids[i]
+                        end
+                    end
+                end
+                if #nextLayer == 0 then break end
+                layer = nextLayer
+            end
+            diag("A2 文本元素命中 %d 个", found)
             else
                 diag("A2 windowElement() 拿不到")
             end
@@ -754,7 +879,14 @@ local function build(x, y)
     local c = hs.canvas.new({ x = x, y = y, w = w, h = h })
     M._canvas = c
 
+    -- 窗口级透明度。canvas 自己的背景矩形虽然带了 alpha，但 Hammerspoon 的
+    -- canvas 窗口默认仍是不透明的 NSWindow——不设这一句，元素里的 alpha 只会在
+    -- 面板**内部**混色，透不出下面被盖住的输入框。窗口级 alpha 才是真半透明。
+    -- 与元素颜色里的 alpha 相乘，所以键帽/文字的保底系数依然有效。
+    pcall(function() c:alpha(M.opacity or 1) end)
+
     local elems = {}
+    local C = colors()          -- 颜色按当前 M.opacity 现算
     -- 注意：hs.canvas 元素的坐标必须包在 frame = {} 里；x/y/w/h 平铺在顶层
     -- 会被 isValueValidForAttribute 拒绝（控制台报 "not a valid canvas attribute"）。
     elems[#elems + 1] = {
@@ -762,7 +894,7 @@ local function build(x, y)
         id = "bg",
         action = "fill",
         frame = { x = 0, y = 0, w = w, h = h },
-        fillColor = COLORS.bg,
+        fillColor = C.bg,
         roundedRectRadii = { xRadius = 10, yRadius = 10 },
     }
     -- 顶部拖动把手：一排圆点提示可拖。落在把手/缝隙/内边距的按下都会拖动。
@@ -771,7 +903,7 @@ local function build(x, y)
         id = "handle",
         text = "· · · · ·",
         textSize = 12 * M.scale,
-        textColor = COLORS.handle,
+        textColor = C.handle,
         textAlignment = "center",
         frame = { x = 0, y = M.pad, w = w, h = M.handleH },
     }
@@ -789,7 +921,7 @@ local function build(x, y)
                 id = def.id,
                 action = "fill",
                 frame = { x = ux, y = ky, w = kw, h = M.keyH },
-                fillColor = def.mod and COLORS.modKey or COLORS.key,
+                fillColor = def.mod and C.modKey or C.key,
                 roundedRectRadii = { xRadius = 5, yRadius = 5 },
             }
             local rectIdx = idx
@@ -799,7 +931,7 @@ local function build(x, y)
                 id = def.id .. "_t",
                 text = labelFor(def),
                 textSize = M.textSize,
-                textColor = COLORS.text,
+                textColor = C.text,
                 textAlignment = "center",
                 frame = { x = ux, y = ky + (M.keyH - M.textSize) / 2 - 1, w = kw, h = M.textSize + 4 },
             }
@@ -852,6 +984,31 @@ local function stopRaiseWatcher()
     if not M._raiseWatcher then return end
     pcall(function() M._raiseWatcher:stop() end)
     M._raiseWatcher = nil
+end
+
+--- 设不透明度并立即生效（不用收起重开）。clamp 到 0.3~1。
+--- 用法：hs.osk.setOpacity(0.6)  更通透 / hs.osk.setOpacity(1) 全实心
+function M.setOpacity(v)
+    v = tonumber(v) or 1
+    v = math.max(0.3, math.min(1, v))
+    M.opacity = v
+    if M._canvas then
+        pcall(function() M._canvas:alpha(v) end)
+        -- 键帽/文字颜色也随opacity 变，得重刷一遍
+        local C = colors()
+        for _, k in ipairs(M._keys) do
+            local def = k.def
+            local fill = def.mod and C.modKey or C.key
+            local on = (def.mod and M.armed[def.mod]) or
+                (def.special == "caps" and M.caps)
+            if on then fill = C.armed end
+            if k.pressed then fill = C.pressed end
+            pcall(function() M._canvas:elementAttribute(k.rect, "fillColor", fill) end)
+            pcall(function() M._canvas:elementAttribute(k.text, "textColor", C.text) end)
+        end
+    end
+    diag("setOpacity(%.2f)", v)
+    return v
 end
 
 function M.show()
