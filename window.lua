@@ -100,14 +100,26 @@ local function withWindow(fn, key)
     local max = screen:frame()
     if not max then return nil end
 
-    diag("[%s] 作用到窗口 (%.0f,%.0f %.0fx%.0f)",
-        tostring(key), frame.x, frame.y, frame.w, frame.h)
+    -- 记下改之前的 frame，fn 会就地改这个 table，事后能对比有没有真的动
+    local oldX, oldY, oldW, oldH = frame.x, frame.y, frame.w, frame.h
+
+    diag("[%s] 窗口 (%.0f,%.0f %.0fx%.0f) 屏幕 (%.0f,%.0f %.0fx%.0f)",
+        tostring(key), frame.x, frame.y, frame.w, frame.h,
+        max.x, max.y, max.w, max.h)
 
     lastRealWindow = win
     local ok, err = pcall(fn, win, frame, max)
     if not ok then
         diag("[%s] setFrame 抛错：%s", tostring(key), tostring(err))
+        return
     end
+    -- **记「改完之后」的 frame**。只记改之前的看不出效果 ——
+    -- 2026-10-03 排查「方向键不生效」时，日志里全是窗口原尺寸，
+    -- 差点以为是 setFrame 没调；真正的问题是「调了但算出来的值等于原值」。
+    diag("[%s] 改后→ (%.0f,%.0f %.0fx%.0f)%s", tostring(key),
+        frame.x, frame.y, frame.w, frame.h,
+        (frame.x == oldX and frame.y == oldY and frame.w == oldW and frame.h == oldH)
+            and "  ← 与改前完全相同（等于没动）" or "")
 end
 
 --- 把 frame 按比例摆放：margin 是相对屏幕宽/高的留白比例。
@@ -120,9 +132,35 @@ local function place(frame, max, xFrac, yFrac, wFrac, hFrac)
 end
 
 --- 把 frame 放到屏幕的某个分区（0/0.5/1 = 左/中/右、上/中/下）。
+---
+--- **注意这个「只挪位置」的算法有个致命前提：窗口必须比屏幕小。**
+--- `max.w - frame.w` 是「还能往右挪多少」，窗口一旦满屏宽（frame.w == max.w）
+--- 这个差就是 0，`gx` 取0 还是 1 **算出来完全一样** —— 四个方向键等于没绑。
+--- 2026-10-03 真机日志实锤：窗口 (0,30 1600x884) 已经是满屏宽，
+--- 于是 left/right 全都原地不动（上下最多挪 29px，肉眼看不出来）。
+--- 这就是「往左往右往上往下好像都不行了」的真正原因，
+--- **不是焦点问题、不是热键没绑定**。
+---
+--- 所以方向键必须**同时改位置和尺寸**（见 snapHalf）。
+--- 这个函数保留给「只想挪、不想改大小」的场合。
 local function placeAt(frame, max, gx, gy)
     frame.x = max.x + (max.w - frame.w) * gx
     frame.y = max.y + (max.h - frame.h) * gy
+end
+
+--- 半屏平铺：**位置和尺寸一起改**。
+---
+--- gx/gy 是目标半区的锚点（0=左/上，1=右/下）。哪个维度传0.5，
+--- 那个维度就保持满长（跨整屏），另一个维度砍成一半 ——
+--- 所以 left/right 是「左右对半」，up/down 是「上下对半」，
+--- 和 Lin 说的「往左往右往上往下」一致。
+local function snapHalf(frame, max, gx, gy)
+    local w = (gx == 0.5) and max.w or (max.w / 2)
+    local h = (gy == 0.5) and max.h or (max.h / 2)
+    frame.x = max.x + (max.w - w) * gx
+    frame.y = max.y + (max.h - h) * gy
+    frame.w = w
+    frame.h = h
 end
 
 --- 铺满整屏。菜单栏/Dock 会盖住窗口一角（用的是 screen:frame()，
@@ -165,18 +203,27 @@ bind("n", function(key)
     end, key)
 end)
 
---- ⌃⌥⌘←/→/↑/↓：窗口靠到对应半屏
---- 只挪位置，**不改窗口大小** —— 想改大小用 ⌃⌥⌘F/N 或系统绿按钮。
+--- ⌃⌥⌘←/→/↑/↓：窗口**平铺**到对应半屏（位置和尺寸一起改）
+---
+--- **必须同时改尺寸**，否则窗口满屏时四个方向全都原地不动
+--- （`placeAt` 的 `max.w - frame.w` 差为 0，gx 取 0 还是 1 结果一样，
+--- 见 placeAt 上面的注释和 2026-10-03 真机日志）。
+---
+--- **参数里0.5 的含义是「这一轴保持满长」，不是「居中」**：
+--- left/right 是「左右对半、上下满高」→ gy 传 0.5；
+--- up/down 是「上下对半、左右满宽」→ gx 传 0.5。
+--- 传错成 0 会变成四分之一块（这个坑踩过一次：测试当场报
+--- 「(0,0) 720x450」—— 高度也被砍半了）。
 local function half(gx, gy)
     return function(key)
         withWindow(function(win, frame, max)
-            placeAt(frame, max, gx, gy)
+            snapHalf(frame, max, gx, gy)
             win:setFrame(frame)
         end, key)
     end
 end
-bind("left",  half(0,   0))
-bind("right", half(1,   0))
+bind("left",  half(0,   0.5))
+bind("right", half(1,   0.5))
 bind("up",    half(0.5, 0))
 bind("down",  half(0.5, 1))
 
