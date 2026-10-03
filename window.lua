@@ -16,11 +16,82 @@ local M = {}
 -- 内部工具
 --------------------------------------------------------------------------------
 
+--- 诊断日志：/tmp/hs-window.log
+---
+--- **必须记「每次热键实际作用到了哪个窗口」**，因为这类故障在屏幕上完全看不出来
+--- （Lin 2026-10-03 报「⌃⌥⌘ 方向键四个都不行了」，看起来像热键没绑定，
+--- 实际可能是 setFrame 作用到了别的窗口上）。日志要能区分三种情况：
+---   ① 压根没拿到窗口（nil）
+---   ② 拿到的是 Hammerspoon 自己的窗口（键盘画布）→ 按了等于按在键盘上
+---   ③ 拿到了真窗口但 setFrame 失败
+--- 不记的话就只能靠猜，而「猜」正是这个项目反复栽跟头的地方。
+local LOG = "/tmp/hs-window.log"
+local function diag(fmt, ...)
+    local ok, msg = pcall(string.format, fmt, ...)
+    if not ok then msg = fmt end
+    local f = io.open(LOG, "a")
+    if f then
+        f:write(os.date("%F %T ") .. tostring(msg) .. "\n")
+        f:close()
+    end
+end
+
+--- 这个窗口是不是 Hammerspoon 自己的（osk 键盘画布、控制台）。
+---
+--- **必须排除，否则热键会作用到键盘面板上。** 2026-10-03 真机 bug：
+--- osk 的 `show()` 会 `M._canvas:show()`，这一步**激活 Hammerspoon**
+--- （NSWindow 的 makeKeyAndOrderFront，激活是异步的），之后靠
+--- `restoreFocusOnce` 在 0/0.1/0.3/0.6s 四个点把前台 App 抢回来。
+--- 只要那几次里有一次没成功（Hammerspoon 自己又被激活、或目标 App
+--- activate 失败），`hs.window.focusedWindow()` 返回的就是**键盘画布**——
+--- 于是 ⌃⌥⌘← 的 setFrame 全作用在键盘面板上，用户看到的就是
+--- 「热键彻底没反应」。四个方向一起失效正是这个症状。
+---
+--- 用 pcall 包住：测试桩件里的假窗口没有 application() 方法。
+--- @return boolean
+local function isOwnWindow(win)
+    local ok, app = pcall(function() return win:application() end)
+    if not ok or not app then return false end
+    local ok2, name = pcall(function() return app:name() end)
+    if not ok2 or not name then return false end
+    return name == "Hammerspoon"
+end
+
+--- 最近一次「真正的」目标窗口。focusedWindow() 被 Hammerspoon 自己占住时的兜底。
+--- @type hs.window|nil
+local lastRealWindow = nil
+
+--- 窗口是否还活着（关掉的窗口调 frame() 可能抛，不是返回 nil）。
+local function alive(win)
+    if not win then return false end
+    local ok, frame = pcall(function() return win:frame() end)
+    return ok and frame ~= nil
+end
+
 --- 拿到一个可操作的窗口，取不到就返回 nil（不弹错、不抢焦点）。
 --- @return hs.window|nil
-local function withWindow(fn)
-    local win = hs.window.focusedWindow()
-    if not win then return nil end
+local function withWindow(fn, key)
+    local focused = hs.window.focusedWindow()
+    local win = focused
+
+    if win and isOwnWindow(win) then
+        diag("[%s] 焦点窗口是 Hammerspoon 自己（多半是 osk 键盘画布）→ 改用最近的真窗口",
+            tostring(key))
+        win = (alive(lastRealWindow) and lastRealWindow) or nil
+    end
+
+    -- 兜底窗口可能是上一次留下的、现在已经关掉的
+    if win and not alive(win) then
+        diag("[%s] 兜底窗口已失效，清掉", tostring(key))
+        lastRealWindow = nil
+        win = nil
+    end
+
+    if not win then
+        diag("[%s] 拿不到可操作窗口（focused=%s）",
+            tostring(key), focused and "Hammerspoon" or "nil")
+        return nil
+    end
 
     local frame = win:frame()
     if not frame then return nil end
@@ -29,7 +100,14 @@ local function withWindow(fn)
     local max = screen:frame()
     if not max then return nil end
 
-    fn(win, frame, max)
+    diag("[%s] 作用到窗口 (%.0f,%.0f %.0fx%.0f)",
+        tostring(key), frame.x, frame.y, frame.w, frame.h)
+
+    lastRealWindow = win
+    local ok, err = pcall(fn, win, frame, max)
+    if not ok then
+        diag("[%s] setFrame 抛错：%s", tostring(key), tostring(err))
+    end
 end
 
 --- 把 frame 按比例摆放：margin 是相对屏幕宽/高的留白比例。
@@ -58,46 +136,55 @@ end
 -- 热键绑定
 --------------------------------------------------------------------------------
 
+--- 绑一个热键，并把**键名传进 withWindow** ——诊断日志要能指出是哪个键，
+--- 否则四个方向键同时失效时，日志里分不出是谁触发的。
+local function bind(key, fn)
+    hs.hotkey.bind({ "ctrl", "alt", "cmd" }, key, function()
+        fn(key)
+    end)
+end
+
 --- ⌃⌥⌘F：铺满当前屏幕
-hs.hotkey.bind({ "ctrl", "alt", "cmd" }, "f", function()
-    withWindow(function(win, frame, max) fill(frame, max) win:setFrame(frame) end)
+bind("f", function(key)
+    withWindow(function(win, frame, max) fill(frame, max) win:setFrame(frame) end, key)
 end)
 
 --- ⌃⌥⌘M：居中，左右各留 12%
-hs.hotkey.bind({ "ctrl", "alt", "cmd" }, "m", function()
+bind("m", function(key)
     withWindow(function(win, frame, max)
         place(frame, max, 0.5, 0, 0.76, 1)
         win:setFrame(frame)
-    end)
+    end, key)
 end)
 
 --- ⌃⌥⌘N：居中，四边各留 20%
-hs.hotkey.bind({ "ctrl", "alt", "cmd" }, "n", function()
+bind("n", function(key)
     withWindow(function(win, frame, max)
         place(frame, max, 0.5, 0.5, 0.6, 0.6)
         win:setFrame(frame)
-    end)
+    end, key)
 end)
 
 --- ⌃⌥⌘←/→/↑/↓：窗口靠到对应半屏
+--- 只挪位置，**不改窗口大小** —— 想改大小用 ⌃⌥⌘F/N 或系统绿按钮。
 local function half(gx, gy)
-    return function()
+    return function(key)
         withWindow(function(win, frame, max)
             placeAt(frame, max, gx, gy)
             win:setFrame(frame)
-        end)
+        end, key)
     end
 end
-hs.hotkey.bind({ "ctrl", "alt", "cmd" }, "left",  half(0,   0))
-hs.hotkey.bind({ "ctrl", "alt", "cmd" }, "right", half(1,   0))
-hs.hotkey.bind({ "ctrl", "alt", "cmd" }, "up",    half(0.5, 0))
-hs.hotkey.bind({ "ctrl", "alt", "cmd" }, "down",  half(0.5, 1))
+bind("left",  half(0,   0))
+bind("right", half(1,   0))
+bind("up",    half(0.5, 0))
+bind("down",  half(0.5, 1))
 
 --- ⌃⌥⌘[ / ⌃⌥⌘]：窗口移到上/下一块屏幕
 --- 注意 moveToScreen 只保证「挪过去」，不保证窗口完整落在新屏幕内；跨不同
 --- 分辨率的屏幕时窗口可能有一部分跑出可视区。沿用原脚本的调用方式。
 local function moveScreen(step)
-    return function()
+    return function(key)
         withWindow(function(win)
             local screens = hs.screen.allScreens()
             if #screens < 2 then return end
@@ -111,8 +198,8 @@ local function moveScreen(step)
             end
             local nextIdx = ((idx - 1 + step) % #screens) + 1
             win:moveToScreen(screens[nextIdx])
-        end)
+        end, key)
     end
 end
-hs.hotkey.bind({ "ctrl", "alt", "cmd" }, "]", moveScreen(1))
-hs.hotkey.bind({ "ctrl", "alt", "cmd" }, "[", moveScreen(-1))
+bind("]", moveScreen(1))
+bind("[", moveScreen(-1))

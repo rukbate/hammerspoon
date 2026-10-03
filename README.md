@@ -87,6 +87,25 @@ Lin 的 macOS Hammerspoon 配置。围绕「蓝牙键盘 / 鼠标 / 触控板」
 | `N` | 四边各留 20%（窗口居中） |
 | `[` `]` | 窗口移到上/ 下一块屏幕，到头后环绕 |
 
+**要改窗口尺寸只有 `F` 和 `N`**，方向键只挪位置 —— 这不是 bug，是 `placeAt()` 的设计。
+
+**焦点被 Hammerspoon 自己占住时的兜底（2026-10-03 修）**
+
+`withWindow()` 会排除 Hammerspoon 自己的窗口，并在焦点落在那儿时**回退到最近一次的真实目标窗口**。
+
+起因：osk 的 `show()` 里 `M._canvas:show()` 会**激活 Hammerspoon**（NSWindow 的
+`makeKeyAndOrderFront`，激活是异步的），之后靠 `restoreFocusOnce` 在 0/0.1/0.3/0.6s
+四个点把前台 App 抢回来。只要有一次没成功，`hs.window.focusedWindow()` 返回的就是
+**键盘画布**，方向键的 `setFrame` 全作用在键盘面板上 —— 现象是「四个方向一起没反应」，
+很容易误判成热键没绑定。现在这种情况会打日志并改用历史窗口。
+
+诊断日志：`/tmp/hs-window.log`，每次按热键都记一行（键名 + 实际作用的窗口 + 坐标）。
+判断方法：
+
+- 完全没有 `[left]` 这行 → 热键真没触发，去查 kbswap 的 `⌘/⌥` 交换状态
+- 有 `[left]` 且窗口坐标是键盘面板那个（宽度接近整屏、y 在屏幕中部）→ 就是本条 bug
+- 有 `[left]` 但窗口是目标 App → `setFrame` 生效了，问题在别处
+
 ### screen.lua — 截屏工具
 
 | 键 | 动作 |
