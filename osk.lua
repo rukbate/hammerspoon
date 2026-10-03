@@ -616,7 +616,28 @@ local function startMousePoll()
     -- 这也顺带让「后台采样器到底有没有在跑」变成**可断言的**，
     -- 而不是只能靠真机看效果。
     M._mousePollTick = tick
-    M._mouseTimer = hs.timer.doInterval(iv, tick)
+    -- **API 名字必须查本机 docs.json 确认，别凭印象写**（2026-10-03 踩过）：
+    -- 这里原来写的是 `hs.timer.doInterval` —— 真机报
+    --   attempt to call a nil value (field 'doInterval')
+    -- 周期定时器的真名是 **`doEvery`**（`hs.timer.doEvery(interval, fn)`）。
+    --
+    -- 为什么会查错：`docs.json` 里模块条目按类别分开，周期定时器全在
+    -- **Constructor** 类别里（doAfter / doAt / doEvery / doUntil / doWhile /
+    -- new / waitUntil / waitWhile），而 Function 类别只有 absoluteTime、
+    -- days、usleep 这些**纯函数**。只 grep Function 就得出「hs.timer 没有
+    -- 周期定时器」的错结论。查文档要**把所有类别都列一遍**。
+    --
+    -- 另外这里**不能裸调**：timer 建不起来（未来 API 改名、测试桩件缺失）
+    -- 时异常会一路冒到 focusedInputInfo 的 pcall，把整条避让关掉。
+    -- 建不起来就降级成「只在 show 时采样一次」，功能弱但不会更糟。
+    local okT, res = pcall(hs.timer.doEvery, iv, tick)
+    if okT and res then
+        M._mouseTimer = res
+    else
+        M._mouseTimer = nil
+        diag("后台鼠标采样器启动失败（%.2fs 一次）：%s —— 降级为只在 show 时采样",
+            iv, tostring(res))
+    end
 end
 
 local function mouseAnchor()
@@ -688,6 +709,49 @@ local TEXT_ROLES = {
 local TEXT_ROLE_SET = {}
 for _, r in ipairs(TEXT_ROLES) do TEXT_ROLE_SET[r] = true end
 
+--- 矩形是否**真的可用**（x/y 必须是数字，w/h 缺省当 0）。
+---
+--- 2026-10-02 真机踩坑：这里原来只检查「是数字」，于是
+--- `AXBoundsForRange` 返回的 **`0x0` 空矩形**（x=0 y=1000 w=0 h=0）被当成有效
+--- 候选——而它在屏幕外，紧接着「输入区不在主屏上」把**整个避让关掉**，
+--- 键盘照样压住输入框。日志原文：
+---   候选 d1.Group/range 光标 (0,1000 0x0)
+---   输入区不在主屏上 → 不做避让
+--- 所以必须要求**有面积**。但「有面积」的判据要说准：
+--- * **w>0 且 h>0** —— 正常情况（含细光标 h=0 那种，见下）
+--- * **w 和 h 不能同时为 0** —— 这才是真正没用的空矩形
+---
+--- 注意**不能要求 h>0**：有些 App 给的插入点就是零高度（一条线），
+--- `choosePosition` 里本来就为此做了「高度 0 按一行估高 18」的处理。
+--- 一开始我写成 `w > 0 and h > 0`，把零高度光标也毙了，导致本来能用的
+--- 候选降级掉、面板退回贴底（测试当场抓到）。
+---
+--- **这个函数必须定义在 dumpAXTree 之前**（2026-10-03 真机 bug）：
+--- 它原本在 dumpAXTree **后面**，而 Lua 里后面 local 的函数在前面不可见
+--- → dump 走到判据 2 就抛
+---   attempt to call a nil value (global 'rectOf')
+--- 子节点 pcall 把它记成一行 `!! walk 失败`，**dump 报告里的
+--- 「可编辑文本区」于是永远是「一个都没有」**——也就是说这个诊断工具
+--- 从上线起就没显示过一个可编辑区，我据此得出的「Electron 不暴露 AX」
+--- 结论一直是错的。修之前先给它补了测试。
+---
+--- 2026-10-02 真机踩坑：这里原来只检查「是数字」，于是
+--- `AXBoundsForRange` 返回的 **`0x0` 空矩形**（x=0 y=1000 w=0 h=0）被当成有效
+--- 候选——而它在屏幕外，紧接着「输入区不在主屏上」把**整个避让关掉**，
+local function validRect(r)
+    if type(r) ~= "table" then return false end
+    local x, y = tonumber(r.x), tonumber(r.y)
+    local w, h = tonumber(r.w or 0), tonumber(r.h or 0)
+    if x == nil or y == nil or w == nil or h == nil then return false end
+    if w < 0 or h < 0 then return false end
+    return (w > 0 and h > 0) or (w > 0 or h > 0)   -- 即：不是 0x0
+end
+
+local function rectOf(b)
+    if not validRect(b) then return nil end
+    return { x = b.x, y = b.y, w = b.w or 0, h = b.h or 0 }
+end
+
 --- 把当前焦点窗口的 AX 树整棵 dump 到 /tmp/osk-axtree.log。
 ---
 --- 为什么需要它：2026-10-02 这次避让连挂三轮——第一轮误判成「Word 正文躲不开」，
@@ -723,7 +787,13 @@ function M.dumpAXTree()
     f:write(string.format("=== %s  窗口「%s」  %s ===\n",
         os.date("%F %T"), win:title(), app:name()))
 
-local counts, layers = {}, {}
+-- **counts.total 必须在这里初始化成 0**（2026-10-03 真机 bug）：
+-- walk 第一行要判 `counts.total > 400`，而 nil 与数字比较会**直接抛错**
+-- （"attempt to compare nil with number"）。于是 walk 在**第一个节点**
+-- 就死掉、根层 pcall 又把错误吞了 → dump 只剩一行标题，报告写的是
+-- 「共 0 个节点；walk 失败 0 个」，看起来像「WorkBuddy 一个 AX 节点都没有」，
+-- 实际是**一个都没走成**。真相被工具自己掩盖了。
+local counts, layers = { total = 0 }, {}
     -- 「能对选区给出有面积的矩形」的节点清单（= 真正的可编辑文本区）。
     -- A2 的判据 2 就是这个口径，这里用同样口径才能直接对照。
     local selHits = {}
@@ -799,7 +869,15 @@ local counts, layers = {}, {}
           end
       end
     end
-    pcall(walk, winEl, 0, "")
+    -- 根层 pcall 的返回值**必须记下来**。子节点的 pcall 记了，根层没记，
+    -- 于是「walk 第一个节点就抛」这件事在报告里完全看不见（只显示
+    -- 「0 个节点」，像是 App 没暴露任何东西）。诊断工具的失败路径
+    -- 自己不能没有诊断。
+    local okRoot, rootErr = pcall(walk, winEl, 0, "")
+    if not okRoot then
+        walkErrors = walkErrors + 1
+        f:write(string.format("!! walk 根调用失败: %s\n", tostring(rootErr)))
+    end
 
     if #selHits > 0 then
         f:write("\n--- 可编辑文本区（能对选区给出有面积的矩形）---\n")
@@ -839,37 +917,6 @@ local counts, layers = {}, {}
     f:close()
     diag("dumpAXTree: 已写入 %s（%d 个节点）", path, counts.total or 0)
     return path
-end
-
---- 矩形是否可用（x/y 必须是数字，w/h 缺省当 0）。
---- 矩形是否**真的可用**。
----
---- 2026-10-02 真机踩坑：这里原来只检查「是数字」，于是
---- `AXBoundsForRange` 返回的 **`0x0` 空矩形**（x=0 y=1000 w=0 h=0）被当成有效
---- 候选——而它在屏幕外，紧接着「输入区不在主屏上」把**整个避让关掉**，
---- 键盘照样压住输入框。日志原文：
----   候选 d1.Group/range 光标 (0,1000 0x0)
----   输入区不在主屏上 → 不做避让
---- 所以必须要求**有面积**。但「有面积」的判据要说准：
---- * **w>0 且 h>0** —— 正常情况（含细光标 h=0 那种，见下）
---- * **w 和 h 不能同时为 0** —— 这才是真正没用的空矩形
----
---- 注意**不能要求 h>0**：有些 App 给的插入点就是零高度（一条线），
---- `choosePosition` 里本来就为此做了「高度 0 按一行估高 18」的处理。
---- 一开始我写成 `w > 0 and h > 0`，把零高度光标也毙了，导致本来能用的
---- 候选降级掉、面板退回贴底（测试当场抓到）。
-local function validRect(r)
-    if type(r) ~= "table" then return false end
-    local x, y = tonumber(r.x), tonumber(r.y)
-    local w, h = tonumber(r.w or 0), tonumber(r.h or 0)
-    if x == nil or y == nil or w == nil or h == nil then return false end
-    if w < 0 or h < 0 then return false end
-    return (w > 0 and h > 0) or (w > 0 or h > 0)   -- 即：不是 0x0
-end
-
-local function rectOf(b)
-    if not validRect(b) then return nil end
-    return { x = b.x, y = b.y, w = b.w or 0, h = b.h or 0 }
 end
 
 --- 在一个 AX 元素上取矩形，逐级降级，结果塞进 out（带来源标注）：
