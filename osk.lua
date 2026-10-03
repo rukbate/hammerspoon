@@ -597,8 +597,22 @@ local function sampleMouse(x, y)
 end
 
 --- 后台鼠标采样器。间隔比hold 小得多，保证「停了多久」记得准。
+---
+--- **必须由 `M.ensureMousePoll()` 在模块加载时就启动，不能等show()**。
+--- 2026-10-03 10:40 真机日志给出的教训：
+---   鼠标在 (1134,14 停了0.00s) → 假想输入区下缘 14
+---   候选 mouse 光标 (1133,-106 2x120)
+---   剔除屏幕外候选 mouse
+--- `still=0.00s` 说明账本里**只有 show() 那一刻的一次采样**。
+--- 原因：采样器原来是在 `mouseAnchor()` 里启动的，而 `mouseAnchor()`
+--- 只在 `show()` 时才被调用 —— 于是「点输入框 → 停顿 → 移到菜单栏 → 点图标」
+--- 这个**真实动作序列全程都没人记账**。计时器是「打开键盘那一刻」才上线的，
+--- 而它要记的东西恰恰发生在**打开之前**。
+--- 这就是「要连按两次键盘才生效」的残留：上一版把停驻判定修好了，
+--- 却漏了「采样器何时上线」这个更底层的前提。
 local function startMousePoll()
     if M._mouseTimer then return end
+    if M.useMouse == false then return end
     local iv = M.mousePollInterval or 0.12
     local function tick()
         if M.useMouse == false then return end
@@ -640,38 +654,65 @@ local function startMousePoll()
     end
 end
 
+--- 启动采样器的对外入口。**在模块加载末尾就调一次**（见文件末尾），
+--- 这样「点输入框 → 停顿 → 点菜单栏图标」这段真实动作会被完整记账。
+--- 重复调用安全（startMousePoll 内部有timer 去重）。
+function M.ensureMousePoll()
+    if M.avoidInput ~= true then return end
+    if M.useMouse == false then return end
+    startMousePoll()
+end
+
+--- 账本是否「有内容」。测试要能断言「采样器确实在跑」，
+--- 否则会出现「真机从没记过账、测试却全绿」的情况（2026-10-03 踩过）。
+function M._mousePollActive()
+    return M._mouseTimer ~= nil
+end
+
 local function mouseAnchor()
     if M.avoidInput ~= true then return nil end
     if M.useMouse == false then return nil end
     startMousePoll()
-    -- 读一次当前鼠标位置（后台timer 已经在记账了，这里只是拿最新值兜底）
-    local ok, pos = pcall(hs.mouse.absolutePosition)
-    if ok and type(pos) == "table" and pos.x and pos.y then
-        sampleMouse(math.floor(pos.x + 0.5), math.floor(pos.y + 0.5))
-    end
+    -- **这里刻意不再采样**（2026-10-03 10:40 真机教训）。
+    --
+    -- 原来有一句「读一次当前鼠标位置兜底」，看着无害，实际有两个害处：
+    -- ① show() 这一刻鼠标在**菜单栏**（点图标打开的必然结果），这次采样
+    --    会把菜单栏位置塞进账本。show() 后面往往紧接着还有第二次调用
+    --    （拖动、focus 变化触发重定位），那时 `_anchorBest` 已经是菜单栏了。
+    -- ② 它让「show 时钟」参与记账，破坏账本的时间语义 —— 账本应该只由
+    --    后台采样器匀速写入，才能代表「鼠标在哪儿待了多久」。
+    --
+    -- 后台采样器现在从**模块加载时**就上线（见 M.ensureMousePoll），
+    -- 到show 时账本早已有内容，这里只读、不写。
     local cur = M._mouse
     if not cur then
+        -- 账本空：只有「采样器刚启动、还没跑过一次」才会这样。
+        -- 兜底读一次当前位置**只用于返回**，绝不写进 _mouse/_anchorBest。
+        local ok, pos = pcall(hs.mouse.absolutePosition)
+        if ok and type(pos) == "table" and pos.x and pos.y then
+            local x, y = math.floor(pos.x + 0.5), math.floor(pos.y + 0.5)
+            local h0 = M.mouseAnchorHeight or 120
+            diag("鼠标账本还是空的（采样器刚上线？）→ 兜底用当前位置 (%.0f,%.0f)", x, y)
+            return { x = x - 1, y = y - h0, w = 2, h = h0 }
+        end
         diag("鼠标位置读不到（pcall 失败且账本为空）")
         return nil
     end
 
     -- **优先用「静置最久的历史位置」**，不是当前这一瞬间。
     --
-    -- 2026-10-03 09:58 真机日志：
-    --   鼠标在动（或刚移动）(1136.0,14.0) → 不用它定位
+    -- 2026-10-03 09:58 / 10:40 真机日志：
+    --   鼠标在 (1136.0,14.0) / 鼠标在 (1134,14 停了0.00s)
     -- y=14 是**菜单栏** —— 触发入口就在菜单栏，点它时鼠标必然在屏幕顶部。
     -- 这不是「鼠标在动」的噪声，而是**结构性失效**：拿「打开那一刻的鼠标
     -- 位置」当输入区代理，在「点菜单栏图标打开」这条主路径下**永远错**。
     --
     -- 真实动作序列是：**点输入框 →（停顿）→ 移到菜单栏 → 点图标**。
     -- 输入区对应的是**那个停顿的位置**，不是最后的位置。
-    --
-    -- 顺带解决上一版那个荒唐前提：要求「先show 一次采样、再过 0.4s 后第二次
-    -- show 才认」，等于**要连按两次键盘才生效**。记账法不需要。
     local best = M._anchorBest
     local h = M.mouseAnchorHeight or 120
     local px, py
-    if best and (best.x ~= cur.x or best.y ~= cur.y) then
+    if best then
         px, py = best.x, best.y
         diag("用鼠标历史静置点 (%.0f,%.0f 停了%.2fs) → 假想输入区下缘 %.0f",
             px, py, best.still, py)
@@ -683,6 +724,26 @@ local function mouseAnchor()
     -- 点→矩形：在鼠标**上方**造一个「假想输入区」，只提供下缘。
     -- 高度取 120 是经验值：够覆盖常见输入框（单行/多行几行）的高度，
     -- 又不会像整页容器那样让避让判断失效。
+    --
+    -- **这个假想区必须整个落在屏幕内才有意义**（2026-10-03 10:40 真机）。
+    -- 账本里若只有菜单栏那个停顿点（py≈14），造出来的矩形是
+    --   (1133,-106 2x120) —— 挂在屏幕**顶部之外**，代表「输入区在屏幕外」，
+    -- 这不是信息，是噪声：它必然被后面的「剔除屏幕外候选」干掉，
+    -- 结果等于白跑一圈再回到贴底（真机日志实测）。
+    -- 与其造一个假矩形去影响落位，不如**在这里就认输**，
+    -- 让日志明确写出「放弃鼠标避让」而不是「剔除屏幕外候选」——
+    -- 后者会让人误以为「探测到了但位置不对」，前者才说得清真相。
+    --
+    -- 判据用「假想区上沿是否在主屏内」，**不是「best 是否等于 cur」**：
+    -- 用快捷键（非菜单栏）触发时，唯一的停顿点恰好就是当前点，
+    -- 那完全合法，不该被这条判据毙掉。
+    local f = hs.screen.mainScreen():frame()
+    if py - h < f.y then
+        diag("鼠标停顿点 (%.0f,%.0f) 太高，造出的假想输入区上沿 %.0f 在屏幕 %.0f 之外"
+            .. " → 放弃鼠标避让（这条线索对菜单栏触发没有意义）",
+            px, py, py - h, f.y)
+        return nil
+    end
     -- **坐标已取整**：几何量带小数一路传到 M._frame.y，会让「点是否落在
     -- 面板内」的边界判断出现 0.5px 模糊带；取整也让日志里的 %d 安全。
     return { x = px - 1, y = py - h, w = 2, h = h }
@@ -1151,6 +1212,17 @@ local function focusedInputInfo(frontApp)
                 -- 别指望用户记得手动跑）。只对同一个 App 自动跑一次，否则
                 -- 每次开键盘都 dump 一次会拖慢启动。
                 if found == 0 then
+                    -- **WorkBuddy 的 AX 树已实测确认**（2026-10-03 10:40，dump 工具
+                    -- 修好之后拿到的真实数据）：整棵树**只有 9 个节点**，
+                    -- role 分布是 AXWindow×1 / AXGroup×5 / AXButton×3，
+                    -- **一个 AXTextField / AXTextArea 都没有**；那 5 个 AXGroup
+                    -- 全是 `(0,30 1600x885)` 整窗大小 + 空选区。
+                    --
+                    -- 也就是说：**不是我们没找对 role，是 Electron 根本没把
+                    -- 输入框暴露给 AX**。A2 这条路对 Electron/Chromium 类 App
+                    -- 结构性无效，继续调深度/调白名单都是白费。
+                    -- 保留它是因为它对**原生 App**（备忘录、Safari、终端…）
+                    -- 仍然有效 —— 那里A1/A2 都好使。
                     local appName = frontApp and frontApp:name() or "?"
                     if M._dumpedFor ~= appName then
                         M._dumpedFor = appName
@@ -1548,4 +1620,18 @@ function M.hideIfShowing()
 end
 
 _G.hsOnScreenKeyboard = M
+
+--- **模块一加载就让后台鼠标采样器上线**（2026-10-03 10:40 真机教训）。
+---
+--- 为什么必须放在这里、而不是等到 show()：采样器记的是「鼠标在哪儿停了
+--- 多久」，而它要记的那段动作——「点输入框 → 停顿 → 移到菜单栏 → 点图标」
+--- ——**发生在键盘被打开之前**。如果采样器在 show() 里才启动，它记的第一笔
+--- 就是「鼠标此刻在菜单栏」，账本里永远只有那个无用的点
+--- （真机日志实测：`鼠标在 (1134,14 停了0.00s)`，
+---   接着 `候选 mouse 光标 (1133,-106 2x120)` 被当屏外剔除）。
+---
+--- 也就是说：**要让记账生效，就必须让它一直在跑**，而不是「用的时候才开」。
+--- 这和「要连按两次键盘才生效」是同一个病根的最后一层。
+pcall(M.ensureMousePoll)
+
 return M
