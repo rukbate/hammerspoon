@@ -81,13 +81,28 @@ M.useMouse    = true    -- 把**鼠标位置**当作输入区的代理（2026-10
                         -- 是个很强的代理。
                         -- 它排在 AX 精确光标之后、粗容器之前（prio 2 vs 1/3）。
                         -- 设false 可关掉，只用 AX 判定。
-M.mouseStillTime = 0.4  -- 鼠标要**静置**这么久（秒）才采信它的位置。
-                        -- 打开键盘时鼠标可能正在移动，或者刚点完菜单栏就按快捷键——
-                        -- 这时位置是噪声，拿它挪键盘会把面板甩到奇怪的地方。
+M.mouseAnchorHold = 0.25   -- 鼠标在**同一个点**静止这么久（秒），才把那个点
+                         -- 记成「候选输入区」记账（M._anchorBest）。
+                         --
+                         -- **为什么改成记账而不是「打开那一刻看一眼」**
+                         -- （2026-10-03 真机日志）：触发键盘的入口是菜单栏图标，
+                         -- 点它时鼠标必然在屏幕顶部（实测 y=14）。而用户真实动作
+                         -- 是「点输入框 →（停顿）→ 移到菜单栏 → 点图标」——
+                         -- 输入区对应的是**那个停顿的位置**，不是最后的位置。
+                         -- 拿打开瞬间的位置当输入区代理，在主路径下永远错。
+                         --
+                         -- 所以改成后台常驻采样（见 M.mousePollInterval），
+                         -- 记住「鼠标在哪儿停得最久」。这还顺带修掉上一版那个
+                         -- 荒唐前提：要「先show 一次、再过 0.4s 后第二次 show」
+                         -- 才生效 —— 等于**要连按两次键盘**。现在不需要了。
+M.mousePollInterval = 0.12 -- 后台鼠标采样间隔（秒）。必须明显小于
+                         -- mouseAnchorHold，否则「停了多久」记得不准。
+                         -- 0.12s 足够（AX 那边每层都是 IPC 级的开销，
+                         -- 鼠标读一次只是取当前值，很便宜）。
 M.mouseAnchorHeight = 120 -- 鼠标位置只是个**点**，没有高度，直接拿来跟面板比重叠
-                        -- 毫无意义（点高 0）。所以在它**上方**造一个这么高的
-                        -- 「假想输入区」，只取它的**下缘**：面板停在鼠标上方，
-                        -- 就不会压住用户刚点击的那个位置。
+                         -- 毫无意义（点高 0）。所以在它**上方**造一个这么高的
+                         -- 「假想输入区」，只取它的**下缘**：面板停在鼠标上方，
+                         -- 就不会压住用户刚点击的那个位置。
 M.opacity     = 0.78    -- 面板不透明度（1 = 全实心）。Lin 要求半透明
                         -- （2026-10-02）：避让总有兜不住的时候（输入区可能占满
                         -- 整页、或根本探测不到），半透明是最后一道保险——
@@ -460,6 +475,13 @@ end
 --- 只能猜：到底是 AX 没给出焦点、还是给了但取不到光标矩形、还是矩形太大
 --- 没法避让。所以每次 show 都把探测链路逐条落盘，排查时先看这个文件。
 --- 文件超过 256KB 自动截断，避免长期运行把 /tmp 撑爆。
+---
+--- **路径可注入（`M.logPath`）**，因为测试和真机共用同一个文件会互相污染：
+--- 2026-10-03 我把 23:35 的测试输出当成真机日志读了好一会儿——日志里
+--- `候选 focus/range 光标 (300,480 2x18)` 一看就是桩件的假坐标，
+--- 而真机记录被埋在后面。**诊断日志被测试污染 = 诊断日志失效**。
+--- 测试里设成 `/tmp/osk-ax-test.log` 之类，真机保持默认。
+---
 --- **本函数必须对任何参数都绝不抛异常**（2026-10-02 踩到）：
 --- 它原来直接 `string.format(fmt, ...)`，而调用点传进来的坐标**可能带小数**
 --- （`hs.mouse.absolutePosition()` 返回 CGFloat，x/y 可能是 700.5），
@@ -481,7 +503,7 @@ local function diag(fmt, ...)
         line = tostring(fmt) .. " (格式化失败, 参数: "
             .. table.concat(raw, ", ") .. ")"
     end
-    local path = "/tmp/osk-ax.log"
+    local path = M.logPath or "/tmp/osk-ax.log"
     local f = io.open(path, "r")
     if f then
         local size = f:seek("end")
@@ -522,44 +544,36 @@ end
 ---
 --- 用户点输入框那一刻，鼠标就在输入区里。所以「鼠标停在哪」是个**很不错的代理**。
 ---
---- 用法上有两条重要限制（都因为它只是个点，不是矩形）：
---- * **只在鼠标停留一段时间后采信**。用户打开键盘时鼠标可能正在移动，或者
----   停在面板外（比如刚点完菜单栏图标就按快捷键）。刚动过的鼠标位置是噪声，
----   用它挪键盘会把面板甩到奇怪的位置。要「静置」过 `M.mouseStillTime` 秒
----   才认，否则返回 nil。
+--- **必须后台持续采样，不能只在 show() 时采一次**（2026-10-03 真机日志逼出来的）。
+--- 上一版只在 `mouseAnchor()` 里采样，而它**只在打开键盘那一刻被调一次**，
+--- 于是「停够了 0.4s」这个前提几乎永远不成立：用户点完输入框、移到菜单栏
+--- 点图标（1~2s），这期间**一次都没采样过**，等 show() 第一次采样时账本
+--- 还是空的。真机日志就是这么废掉的：
+---   鼠标在动（或刚移动）(1136.0,14.0) → 不用它定位
+--- y=14 是**菜单栏** —— 触发入口就在菜单栏，点它时鼠标必然在屏幕顶部。
+--- 这不是「鼠标在动」的噪声，是**结构性失效**：拿「打开那一刻的鼠标位置」
+--- 当输入区代理，在「点菜单栏图标打开」这条主路径下**永远错**。
+---
+--- 而真实动作序列是：**点输入框 →（停顿）→ 移到菜单栏 → 点图标**。
+--- 输入区对应的是**那个停顿的位置**，不是最后的位置。
+--- 所以改成常驻 timer 采样（`M.mousePollInterval`，默认 0.12s），
+--- 记账「鼠标在这个点待了多久」，把**静置最久**的位置存成 `M._anchorBest`，
+--- show 时用它。这样「刚才那一瞬间鼠标不在输入框」不再等于
+--- 「没有输入框信息」，也不需要「连按两次键盘才生效」。
+---
+--- 用法上有一条重要限制（因为它只是个点，不是矩形）：
 --- * **它只是个点，没有高度**，所以不能直接当容器用（点的高度是 0，
 ---   拿去跟面板比重叠毫无意义）。做法是把它当成「输入区的上沿提示」：
 ---   在鼠标位置**上方**加一个合理高度，得到一个「假想输入区」矩形，
 ---   让它只提供**下缘**这个信息——面板停在鼠标上方就不会压住点击处。
 ---   标记为 `precise`（它比整页容器精确得多，比真光标粗但足够用）。
-local function mouseAnchor()
-    if M.avoidInput ~= true then return nil end
-    if M.useMouse == false then return nil end
-    -- **函数名是 `absolutePosition`，不是 `getAbsolutePosition`**（查本机
-    -- docs.json 确认，签名 `hs.mouse.absolutePosition([point]) -> point`，
-    -- 无参即读当前值）。写错名字会被 pcall 静默吞掉、整个功能永不生效——
-    -- 跟 A3 那次 `pcall(app)` 一模一样的坑，所以在这里显式注明。
-    --
-    -- 坐标系：本项目已真机坐实是**左上原点、y 向下**，与 hs.screen:frame() /
-    -- hs.canvas 同一套（见 MEMORY「坐标系」条目），可直接与面板几何比较。
-    local ok, pos = pcall(hs.mouse.absolutePosition)
-    if not ok or type(pos) ~= "table" or not pos.x or not pos.y then
-        diag("鼠标位置读不到（pcall 失败）")
-        return nil
-    end
-    -- 取整再比较：CGFloat 带小数时，同一个物理位置两次读回可能有 0.5 的差，
-    -- 会被误判成「鼠标在动」，静置判定永远不成立。
-    local x, y = math.floor(pos.x + 0.5), math.floor(pos.y + 0.5)
-
-    -- 静置判断：跟上一次记录的位置比，位置没变 + 停够了时间才算「静置」。
-    --
-    -- **时钟必须用 `hs.timer.absoluteTime()`（纳秒单调时钟）**：
-    -- *不能用 `os.time()`* —— 它只到**秒**级精度，而 mouseStillTime 默认 0.4s
-    --  是亚秒阈值。同秒内两次 show 会算出 `now - last.t == 0 < 0.4`，
-    --  静置判定永远不成立（实测踩到：测试里两次 show 挨着跑，
-    --  鼠标候选一次都没生效）。
-    -- *也不能用 `os.clock()`* —— 那是 CPU 时间，空闲时根本不走。
-    -- absoluteTime 还能免疫「系统时间被调整」，比 secondsSinceEpoch 更稳。
+--- 把一次采样记进「鼠标在哪儿停了多久」的账本。
+---
+--- **必须是后台持续调用，不能只在 show() 时调一次**（2026-10-03 真机日志逼出来的）：
+--- 只在 show() 里采样的话，「停够了 mouseAnchorHold 秒」这个前提几乎永远
+--- 不成立 —— 用户点完输入框、移到菜单栏点图标（1~2s），这期间**一次都没采样**，
+--- 等 show() 第一次采样时账本还是空的。
+local function sampleMouse(x, y)
     local now
     if hs.timer and hs.timer.absoluteTime then
         local okT, t = pcall(hs.timer.absoluteTime)
@@ -568,27 +582,89 @@ local function mouseAnchor()
         now = os.time()
     end
     local last = M._mouse
-    local still = false
+    local still = 0
     if last and last.x == x and last.y == y then
-        still = (now - last.t) >= (M.mouseStillTime or 0.4)
+        still = (last.still or 0) + math.max(0, now - (last.t or now))
     end
-    M._mouse = { x = x, y = y, t = now }
-    if not still then
-        diag("鼠标在动（或刚移动）(%.1f,%.1f) → 不用它定位", x, y)
+    M._mouse = { x = x, y = y, t = now, still = still }
+    -- 静置够久就存成「候选输入区」。取**静置最久**的那个，不是最新那个：
+    -- 最新那个大概率是菜单栏（点图标那一刻鼠标在屏幕顶部）。
+    local best = M._anchorBest
+    local hold = M.mouseAnchorHold or 0.25
+    if still >= hold and (not best or still > best.still) then
+        M._anchorBest = { x = x, y = y, still = still }
+    end
+end
+
+--- 后台鼠标采样器。间隔比hold 小得多，保证「停了多久」记得准。
+local function startMousePoll()
+    if M._mouseTimer then return end
+    local iv = M.mousePollInterval or 0.12
+    local function tick()
+        if M.useMouse == false then return end
+        local ok, pos = pcall(hs.mouse.absolutePosition)
+        -- **函数名是 absolutePosition，不是 getAbsolutePosition**（查本机
+        -- docs.json 确认）。写错会被 pcall 静默吞掉、整条路永不生效——
+        -- 跟 A3 那次 pcall(app) 一模一样的坑。
+        if ok and type(pos) == "table" and pos.x and pos.y then
+            -- **取整再比较**：CGFloat 带小数时，同一物理位置两次读回可能差 0.5，
+            -- 会被误判成「鼠标在动」，静置时间永远累积不起来。
+            sampleMouse(math.floor(pos.x + 0.5), math.floor(pos.y + 0.5))
+        end
+    end
+    -- 把回调挂出来给测试驱动（测试里没有真timer，只能手动喂）。
+    -- 这也顺带让「后台采样器到底有没有在跑」变成**可断言的**，
+    -- 而不是只能靠真机看效果。
+    M._mousePollTick = tick
+    M._mouseTimer = hs.timer.doInterval(iv, tick)
+end
+
+local function mouseAnchor()
+    if M.avoidInput ~= true then return nil end
+    if M.useMouse == false then return nil end
+    startMousePoll()
+    -- 读一次当前鼠标位置（后台timer 已经在记账了，这里只是拿最新值兜底）
+    local ok, pos = pcall(hs.mouse.absolutePosition)
+    if ok and type(pos) == "table" and pos.x and pos.y then
+        sampleMouse(math.floor(pos.x + 0.5), math.floor(pos.y + 0.5))
+    end
+    local cur = M._mouse
+    if not cur then
+        diag("鼠标位置读不到（pcall 失败且账本为空）")
         return nil
     end
 
-    -- 点→矩形：在鼠标上方造一个「假想输入区」。
+    -- **优先用「静置最久的历史位置」**，不是当前这一瞬间。
+    --
+    -- 2026-10-03 09:58 真机日志：
+    --   鼠标在动（或刚移动）(1136.0,14.0) → 不用它定位
+    -- y=14 是**菜单栏** —— 触发入口就在菜单栏，点它时鼠标必然在屏幕顶部。
+    -- 这不是「鼠标在动」的噪声，而是**结构性失效**：拿「打开那一刻的鼠标
+    -- 位置」当输入区代理，在「点菜单栏图标打开」这条主路径下**永远错**。
+    --
+    -- 真实动作序列是：**点输入框 →（停顿）→ 移到菜单栏 → 点图标**。
+    -- 输入区对应的是**那个停顿的位置**，不是最后的位置。
+    --
+    -- 顺带解决上一版那个荒唐前提：要求「先show 一次采样、再过 0.4s 后第二次
+    -- show 才认」，等于**要连按两次键盘才生效**。记账法不需要。
+    local best = M._anchorBest
+    local h = M.mouseAnchorHeight or 120
+    local px, py
+    if best and (best.x ~= cur.x or best.y ~= cur.y) then
+        px, py = best.x, best.y
+        diag("用鼠标历史静置点 (%.0f,%.0f 停了%.2fs) → 假想输入区下缘 %.0f",
+            px, py, best.still, py)
+    else
+        px, py = cur.x, cur.y
+        diag("鼠标在 (%.0f,%.0f 停了%.2fs) → 假想输入区下缘 %.0f",
+            px, py, cur.still or 0, py)
+    end
+    -- 点→矩形：在鼠标**上方**造一个「假想输入区」，只提供下缘。
     -- 高度取 120 是经验值：够覆盖常见输入框（单行/多行几行）的高度，
     -- 又不会像整页容器那样让避让判断失效。
-    local h = M.mouseAnchorHeight or 120
-    -- **坐标取整**：鼠标返回的是 CGFloat，可能是 700.5 这种带小数的值。
-    -- 几何量带小数一路传到 M._frame.y，会让「点是否落在面板内」的边界判断
-    -- 出现 0.5px 的模糊带。取整后行为确定，也顺带让日志里的 %d 安全。
-    local rect = { x = math.floor(x) - 1, y = math.floor(y) - h, w = 2, h = h }
-    diag("鼠标静置于 (%.1f,%.1f) → 假想输入区 (%.1f,%.1f %.1fx%.1f) 下缘 %.1f",
-        x, y, rect.x, rect.y, rect.w, rect.h, rect.y + rect.h)
-    return rect
+    -- **坐标已取整**：几何量带小数一路传到 M._frame.y，会让「点是否落在
+    -- 面板内」的边界判断出现 0.5px 模糊带；取整也让日志里的 %d 安全。
+    return { x = px - 1, y = py - h, w = 2, h = h }
 end
 
 --- A2「按 role 找输入框」的遍历上限。Chromium 会把可编辑区埋好几层
@@ -639,72 +715,91 @@ function M.dumpAXTree()
         diag("dumpAXTree: windowElement() 拿不到（%s）", app:name()); return
     end
 
-    local path = "/tmp/osk-axtree.log"
+    -- 路径跟着 diag 走（测试注入到别处，避免覆盖真机的诊断文件）
+    local path = (M.logPath and M.logPath:gsub("osk%-ax", "osk-axtree"))
+        or "/tmp/osk-axtree.log"
     local f = io.open(path, "w")
     if not f then diag("dumpAXTree: 写不了 %s", path); return end
     f:write(string.format("=== %s  窗口「%s」  %s ===\n",
         os.date("%F %T"), win:title(), app:name()))
 
-    local counts, layers = {}, {}
+local counts, layers = {}, {}
     -- 「能对选区给出有面积的矩形」的节点清单（= 真正的可编辑文本区）。
     -- A2 的判据 2 就是这个口径，这里用同样口径才能直接对照。
     local selHits = {}
     local emptyHits = {}
+    -- 2026-10-03 09:58 真机踩坑：dump 跑完只剩一行标题、树是空的。
+    -- 原因是 walk 内部**任何一个节点读AX 抛异常**，整个 walk 就被中断，
+    -- 而 dumpAXTree 是被 `pcall(M.dumpAXTree)` 调用的 → 异常被静默吞掉，
+    -- 什么也没写出来。**自动诊断工具自己崩了却一声不吭**，比不 dump 更糟：
+    -- 它让人以为「树里真的什么都没有」，实际是没写出来。
+    -- 所以每个节点都包一层 pcall，坏节点跳过、其余照常写。
+    local walkErrors = 0
     local function walk(el, depth, pathStr)
-        if depth > 8 or counts.total > 400 then return end
-        counts.total = (counts.total or 0) + 1
-        local role = axAttr(el, "AXRole") or "?"
-        counts[role] = (counts[role] or 0) + 1
-        layers[depth] = layers[depth] or 0
-        layers[depth] = layers[depth] + 1
+      if depth > 8 or counts.total > 400 then return end
+      counts.total = (counts.total or 0) + 1
+      local role = axAttr(el, "AXRole") or "?"
+      counts[role] = (counts[role] or 0) + 1
+      layers[depth] = layers[depth] or 0
+      layers[depth] = layers[depth] + 1
 
-        -- 能不能**对选区给出有面积的矩形**？能 → 它就是可编辑文本区。
-        -- 注意这里跟 A2 的判据 2 是**同一个口径**：只判「选区非 nil」会把
-        -- Chromium 那堆返回 {location=0,length=0} 空选区的 AXGroup 全算进来
-        -- （真机日志就是这么把一个 0x0 的屏外矩形当成唯一候选的）。
-        local flag = ""
-        if TEXT_ROLE_SET[role] then
-            flag = "  <<< 文本 role"
-        else
-            local sel = axAttr(el, "AXSelectedTextRange")
-            if sel == nil then sel = axAttr(el, "AXSelectedTextRanges") end
-            if type(sel) == "table" then
-                local one = sel.location and sel or sel[1]
-                if type(one) == "table" and tonumber(one.location) then
-                    local b = rectOf(axParam(el, "AXBoundsForRange", one))
-                    if b then
-                        flag = "  <<< 可编辑(有面积的选区)"
-                        selHits[#selHits + 1] = string.format(
-                            "%s%s  depth=%d  (%d,%d %dx%d)",
-                            pathStr, role, depth, b.x, b.y, b.w, b.h)
-                    else
-                        flag = "  (空选区，无矩形 → 不是可编辑区)"
-                        emptyHits[#emptyHits + 1] = string.format(
-                            "%s%s  depth=%d", pathStr, role, depth)
-                    end
-                end
-            end
-        end
+      -- 能不能**对选区给出有面积的矩形**？能 → 它就是可编辑文本区。
+      -- 注意这里跟 A2 的判据 2 是**同一个口径**：只判「选区非 nil」会把
+      -- Chromium 那堆返回 {location=0,length=0} 空选区的 AXGroup 全算进来
+      -- （真机日志就是这么把一个 0x0 的屏外矩形当成唯一候选的）。
+      local flag = ""
+      if TEXT_ROLE_SET[role] then
+          flag = "  <<< 文本 role"
+      else
+          local sel = axAttr(el, "AXSelectedTextRange")
+          if sel == nil then sel = axAttr(el, "AXSelectedTextRanges") end
+          if type(sel) == "table" then
+              local one = sel.location and sel or sel[1]
+              if type(one) == "table" and tonumber(one.location) then
+                  local b = rectOf(axParam(el, "AXBoundsForRange", one))
+                  if b then
+                      flag = "  <<< 可编辑(有面积的选区)"
+                      selHits[#selHits + 1] = string.format(
+                          "%s%s  depth=%d  (%.0f,%.0f %.0fx%.0f)",
+                          pathStr, role, depth, b.x, b.y, b.w, b.h)
+                  else
+                      flag = "  (空选区，无矩形 → 不是可编辑区)"
+                      emptyHits[#emptyHits + 1] = string.format(
+                          "%s%s  depth=%d", pathStr, role, depth)
+                  end
+              end
+          end
+      end
 
-        -- 有矩形的节点才可能是输入区，记下来
-        local pos  = axAttr(el, "AXPosition")
-        local size = axAttr(el, "AXSize")
-        if type(pos) == "table" and type(size) == "table"
-            and pos.x and pos.y and size.w and size.h then
-            f:write(string.format("%s%s  (%.0f,%.0f %.0fx%.0f)%s\n",
-                pathStr, role, pos.x, pos.y, size.w, size.h, flag))
-        else
-            f:write(string.format("%s%s%s\n", pathStr, role, flag))
-        end
+      -- 有矩形的节点才可能是输入区，记下来。
+      -- **坐标一律用 %.0f 并取整**：AX 返回的是 CGFloat（可能 700.5），
+      -- `%d` 遇到非整数直接抛 "number has no integer representation"
+      -- （2026-10-02 已经在 diag 上踩过一次，见上面diag 的注释）。
+      local pos  = axAttr(el, "AXPosition")
+      local size = axAttr(el, "AXSize")
+      if type(pos) == "table" and type(size) == "table"
+          and pos.x and pos.y and size.w and size.h then
+          f:write(string.format("%s%s  (%.0f,%.0f %.0fx%.0f)%s\n",
+              pathStr, role, pos.x, pos.y, size.w, size.h, flag))
+      else
+          f:write(string.format("%s%s%s\n", pathStr, role, flag))
+      end
 
-        local kids = axAttr(el, "AXChildren")
-        if type(kids) == "table" then
-            for i = 1, math.min(#kids, 30) do
-                walk(kids[i], depth + 1, pathStr .. "  ")
-            end
-        end
+      local kids = axAttr(el, "AXChildren")
+      if type(kids) == "table" then
+          for i = 1, math.min(#kids, 30) do
+              -- **每个子节点单独包 pcall**：一个坏节点不能毁掉整棵树的输出。
+              -- （2026-10-03：dump 只剩一行标题就是这个原因）
+              local okW, err = pcall(walk, kids[i], depth + 1, pathStr .. "  ")
+              if not okW then
+                  walkErrors = walkErrors + 1
+                  f:write(string.format("%s  !! walk 失败: %s\n",
+                      pathStr, tostring(err)))
+              end
+          end
+      end
     end
-    walk(winEl, 0, "")
+    pcall(walk, winEl, 0, "")
 
     if #selHits > 0 then
         f:write("\n--- 可编辑文本区（能对选区给出有面积的矩形）---\n")
@@ -725,6 +820,14 @@ function M.dumpAXTree()
     f:write("\n--- 各深度节点数 ---\n")
     for d = 0, 8 do
         if layers[d] then f:write(string.format("深度 %d: %d\n", d, layers[d])) end
+    end
+    f:write(string.format("\n共 %d 个节点；walk 失败 %d 个\n",
+        counts.total or 0, walkErrors))
+    if (counts.total or 0) == 0 then
+        -- 这个分支是「诊断工具自己废了」的信号，必须显式写出来，
+        -- 否则下次看到空文件会误判成「App 没暴露任何节点」。
+        f:write("!! 一个节点都没walk 到 —— winEl 可能读不出 AXRole/AXChildren，\n")
+        f:write("!! 或者 walk 在第一个节点就抛了（读 AX 失败会抛，不是返回 nil）。\n")
     end
     f:write("\n--- role 统计 ---\n")
     local names = {}
