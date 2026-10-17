@@ -59,8 +59,11 @@ for _, k in ipairs({ "keyH", "unit", "gap", "pad", "handleH", "textSize" }) do
     M[k] = M[k] * M.scale
 end
 
---- 修饰键 armed 状态（sticky）。shift/ctrl/alt/cmd 对下一次普通按键生效后清空。
-M.armed = { shift = false, ctrl = false, alt = false, cmd = false }
+--- 修饰键 armed 状态（sticky）。下一次普通按键生效后全部清空。
+--- fn 也在里面（2026-10-05）：`hs.eventtap.keyStroke` 的 modifiers 表原生
+--- 接受 "fn"（docs.json 原文列举了 "fn", "ctrl", "alt", "cmd", "shift"），
+--- 不需要手工用 newKeyEvent 拼 flag，直接塞进 mods 表即可。
+M.armed = { shift = false, ctrl = false, alt = false, cmd = false, fn = false }
 M.caps  = false         -- 内部大小写状态（不发系统 capslock 事件）
 M._keys = {}            -- 每个键的运行时信息 { def, rect, text, cx, cy, cw, ch, pressed }
 M._drag = nil           -- 拖动中：{ mx, my, fx, fy }（鼠标起点 + 面板起点）
@@ -103,14 +106,26 @@ M.mouseAnchorHeight = 120 -- 鼠标位置只是个**点**，没有高度，直�
                          -- 毫无意义（点高 0）。所以在它**上方**造一个这么高的
                          -- 「假想输入区」，只取它的**下缘**：面板停在鼠标上方，
                          -- 就不会压住用户刚点击的那个位置。
-M.opacity     = 0.78    -- 面板不透明度（1 = 全实心）。Lin 要求半透明
+M.opacity     = 0.88    -- 面板不透明度（1 = 全实心）。Lin 要求半透明
                         -- （2026-10-02）：避让总有兜不住的时候（输入区可能占满
                         -- 整页、或根本探测不到），半透明是最后一道保险——
                         -- 挡不死，至少能透出下面的输入框。
                         -- 0.6~0.8 比较合适；< 0.5 键帽会太透、看不清字。
+                        -- 2026-10-05 Lin 说「稍微不透明一点点」：0.78 → 0.88
+                        -- （仍留一点透光，但基本是实心的手感）。
                         -- 改完立即生效（不用重载），下一次 M.show() 时应用。
                         -- 想临时完全不透明：hs.osk.opacity = 1
 M._repeat = nil         -- 按住连发的定时器
+
+--- **听写（语音输入）键发的组合键**。
+---
+--- 屏幕键盘**触发不了 macOS 的「按 Fn 键两次」**（2026-10-05 四轮真机实测）：
+--- 实体 FN 走 `systemDefined`、原样回放的合成事件也发得出去，但系统的听写检测
+--- 在 HID 层认事件来源，合成事件不认。这条路别再钻了。
+--- ⇒ 改发**普通组合键**：把「系统设置 → 键盘 → 听写 → 快捷键」设成这里的组合
+--- （默认 ⌃⌥Space），屏幕键盘点「听写」键即可，实体键盘用同一组合也能唤出。
+--- 想换成别的组合，**只改这一行**（布局里那个键直接引用它）。
+M.dictationCombo = { mods = { "ctrl", "alt" }, k = "space" }
 M._tap = nil            -- 事件拦截 tap
 M._watchdog = nil       -- tap 看门狗（系统禁用后自动重启）
 M._capturing = false    -- 正在按（mouseDown 起到 mouseUp 止，期间事件全吞）
@@ -118,75 +133,146 @@ M._pressing = nil       -- 当前按住的键记录
 M._targetApp = nil      -- show 时记录的目标 App（还原 show 抢走的焦点用）
 M._axTimeoutSet = false -- AX 全局超时是否已设（只设一次，见 focusedInputRect）
 
---- 布局（ANSI 104 键的可用子集，每行宽度恒为 15 单位）。
+--- 布局（洛菲小顺 75% 配列：主键区 + 右侧导航列 Home/End/PgUp/PgDn +
+--- 顶排右端 ⌘C/⌘V/⌦；每行宽度恒为 16 单位）。
+---
 --- 每个键：t=显示文字 k=hs.keycodes 键名 s=shift 层文字 w=宽度(默认1)
 ---         mod=修饰键(sticky) rep=按住连发 special="caps"
+---         combo={mods={...}, k="..."} 组合键（整组直发，见 sendKey）
+--- 留白：spacer(w) —— 只把行内 x 往前推，不画键、不可点。
+---
+--- **每行必须等宽**：panelSize() 按「最宽的一行」算面板宽度，行与行之间只是
+--- 从上往下依次排，哪一行短了右边就缺一块。加/删键后务必核对下面的宽度表。
+---
+--- **顶排右端为什么是 ⌘C/⌘V 而不是 PrtSc/Ins**（2026-10-05 查实）：
+--- `hs.keycodes.map` 里压根没有 print/scrolllock/pause/insert 这几个名字 ——
+--- 不是文档漏写，是在 `libkeycodes.dylib` 的键名表里也搜不到，因为 **Mac 键盘
+--- 物理上就没这三个键位**（它们的活儿在 macOS 上归 F13/F14/F15）。写进布局
+--- 只会让 keyStroke 静默打空。Lin 拍板：这两个键位改成 Mac 的拷贝/粘贴
+--- （combo 直发 ⌘C/⌘V）。**别再往布局里加不存在的键名**——它不会报错，
+--- 只会没反应。
+---
+--- 宽度核对（改动后请重跑测试里那组「每行右缘像素对齐」断言）：
+---   行1  1 + 12×1 + 0.75×4（⌘C/⌘V/⌦ 缩窄给「听写」腾位）= 16
+---   行2  13  + 2    + 1                                = 16
+---   行3  1.5 + 10+2 + 1.5 + 1                          = 16
+---   行4  1.75+ 9+2  + 2.25 + 1                         = 16
+---   行5  2.25+ 7+3  + 1.75 + 1 + 1                     = 16
+---   行6  1+1+1.25 + 5.5 + 1.25+1+1+1 + 1+1+1           = 16
+---
+--- **对齐的唯一判据是「累计单位位置」，不是「每行键宽合计」**（2026-10-05 推导）：
+--- build() 里键宽是 `w*unit+(w-1)*gap`、每个键后面再补 1 个 gap，展开后第 i 个键
+---   x_i   = pad + P_i*(unit+gap)          P_i = 它前面所有键宽度之和
+---   右缘  = pad + (P_i+w_i)*(unit+gap) - gap
+--- ⇒ **两个键只要累计单位位置相同就必然像素对齐**，跟各自那一行有几个键无关。
+--- 反过来「每行键宽合计相等」在各行键数不同时**并不等于**对齐——别拿单位数
+--- 当对齐判据，直接测像素右缘（测试 13.1 就是这么断言的）。
+---
+--- **行5 的右 ⇧ 是 1.75，不是常见的 2.75**（2026-10-05 Lin 反馈「右 ⇧ 跟 ↑
+--- 之间空隙太大」）：原先是「右⇧ 1.5 + 留白 0.25」，留白那 0.25 单位在面板上
+--- 就是一条显眼的空缝。把 0.25 并进右⇧、撤掉留白，↑ 的累计位置**不变**
+--- （仍是 2.25+10+1.75 = 14.0，与 ↓ 的 14.0 像素对齐），行宽也仍是 16，
+--- 而 ⇧ 与 ↑ 之间只剩标准的 1 个 gap。**动行5/行6 任何宽度都会破坏 ↑↓ 对齐**。
 local function key(t, k, s, w, extra)
     local def = { t = t, k = k, s = s, w = w or 1 }
     if extra then for kk, vv in pairs(extra) do def[kk] = vv end end
     return def
 end
 
+--- 行内留白：只把行内 x 往前推，不画键、不可点。
+--- **当前布局已经不用它了**（2026-10-05 把 ↑ 前那 0.25 的留白并进了右⇧ 的键宽，
+--- 见布局头注释），留着是因为改布局顶位时还会用到——比如要让某个键落在
+--- 上一行某个键正下方、又不能改键宽的时候。
+local function spacer(w)
+    return { spacer = true, w = w or 1, t = "", k = "" }
+end
+
 local LAYOUT = {
-    { -- F 排：esc + F1~F12（Apple 布局；总宽 1.5 + 12×1.125 = 15 单位）
-        key("esc", "escape", nil, 1.5),
-        key("F1", "f1", nil, 1.125), key("F2", "f2", nil, 1.125),
-        key("F3", "f3", nil, 1.125), key("F4", "f4", nil, 1.125),
-        key("F5", "f5", nil, 1.125), key("F6", "f6", nil, 1.125),
-        key("F7", "f7", nil, 1.125), key("F8", "f8", nil, 1.125),
-        key("F9", "f9", nil, 1.125), key("F10", "f10", nil, 1.125),
-        key("F11", "f11", nil, 1.125), key("F12", "f12", nil, 1.125),
+    { -- 顶排：esc + F1~F12 + ⌘C/⌘V/⌦（洛菲小顺的 PrtSc/Ins 位，
+      -- Mac 没有这两个键名，按 Lin 的要求改成拷贝/粘贴组合键）
+        key("esc", "escape", nil, 1),
+        key("F1", "f1"), key("F2", "f2"), key("F3", "f3"),
+        key("F4", "f4"), key("F5", "f5"), key("F6", "f6"),
+        key("F7", "f7"), key("F8", "f8"), key("F9", "f9"),
+        key("F10", "f10"), key("F11", "f11"), key("F12", "f12"),
+        -- 顶排右端四键各 0.75：**总和必须正好是 3**（1 + 12 + 3 = 16）。
+        -- 别用 0.667 这种无限小数：0.667×3 = 2.001，多出的 0.001 单位会让顶排
+        -- 比其它行宽 0.1px，跨行右缘立刻对不齐（2026-10-05 加听写键时踩到）。
+        key("⌘C", nil, nil, 0.75, { combo = { mods = { "cmd" }, k = "c" } }),
+        key("⌘V", nil, nil, 0.75, { combo = { mods = { "cmd" }, k = "v" } }),
+        key("Del", "forwarddelete", nil, 0.75, { rep = true }),
+        -- 听写键：发 M.dictationCombo（默认 ⌃⌥Space）。**为什么不能直接发 FN**
+        -- 见 M.dictationCombo 处的注释——系统的 FN 双击检测不认合成事件。
+        key("听写", nil, nil, 0.75, { combo = M.dictationCombo }),
     },
-    {
+    { -- 数字行 + 导航列 Home
         key("`", "`", "~"), key("1", "1", "!"), key("2", "2", "@"),
         key("3", "3", "#"), key("4", "4", "$"), key("5", "5", "%"),
         key("6", "6", "^"), key("7", "7", "&"), key("8", "8", "*"),
         key("9", "9", "("), key("0", "0", ")"), key("-", "-", "_"),
-        key("=", "=", "+"), key("⌫", "delete", nil, 2, { rep = true }),
+        key("=", "=", "+"), key("Backspace", "delete", nil, 2, { rep = true }),
+        key("home", "home"),
     },
-    {
+    { -- Tab 行 + 导航列 End
         key("⇥", "tab", nil, 1.5),
         key("q", "q"), key("w", "w"), key("e", "e"), key("r", "r"),
         key("t", "t"), key("y", "y"), key("u", "u"), key("i", "i"),
         key("o", "o"), key("p", "p"),
         key("[", "[", "{"), key("]", "]", "}"), key("\\", "\\", "|", 1.5),
+        key("end", "end"),
     },
-    {
+    { -- Caps 行 + 导航列 PgUp
         key("⇪", "capslock", nil, 1.75, { special = "caps" }),
         key("a", "a"), key("s", "s"), key("d", "d"), key("f", "f"),
         key("g", "g"), key("h", "h"), key("j", "j"), key("k", "k"),
         key("l", "l"), key(";", ";", ":"), key("'", "'", '"'),
         key("⏎", "return", nil, 2.25),
+        key("pgup", "pageup"),
     },
-    {
+    { -- Shift 行 + ↑ + 导航列 PgDn。
+      -- 右⇧ 1.75 是解出来的对齐参数（见布局头注释），别乱动。
         key("⇧", "shift", nil, 2.25, { mod = "shift" }),
         key("z", "z"), key("x", "x"), key("c", "c"), key("v", "v"),
         key("b", "b"), key("n", "n"), key("m", "m"),
         key(",", ",", "<"), key(".", ".", ">"), key("/", "/", "?"),
-        key("⇧", "shift", nil, 2.75, { mod = "shift" }),
+        key("⇧", "shift", nil, 1.75, { mod = "shift" }),
+        key("↑", "up", nil, 1, { rep = true }),
+        key("pgdn", "pagedown"),
     },
-    { -- 底排：esc 移走后空格加宽（5.5）补齐 15 单位
+    { -- 底排：空格右侧 ⌘/fn/⌥/⌃（洛菲小顺顺序）+ ←↓→
         key("⌃", "ctrl", nil, 1, { mod = "ctrl" }),
         key("⌥", "alt", nil, 1, { mod = "alt" }),
         key("⌘", "cmd", nil, 1.25, { mod = "cmd" }),
         key("", "space", nil, 5.5),
         key("⌘", "cmd", nil, 1.25, { mod = "cmd" }),
+        key("fn", "fn", nil, 1, { mod = "fn" }),
         key("⌥", "alt", nil, 1, { mod = "alt" }),
+        key("⌃", "ctrl", nil, 1, { mod = "ctrl" }),
         key("←", "left", nil, 1, { rep = true }),
-        key("↑", "up", nil, 1, { rep = true }),
         key("↓", "down", nil, 1, { rep = true }),
         key("→", "right", nil, 1, { rep = true }),
     },
 }
 
---- 面板总宽高（所有行同宽，取第一行算；顶部另有拖动把手条）。
+--- 面板总宽高（取**最宽的一行**算）。
+---
+--- ⚠️ 宽度公式必须按「实际排出来的像素」算，不能想当然：
+--- 键宽是 `w*unit + (w-1)*gap`（2 单位的键内部自带 1 个 gap），键与键之间再
+--- 加 1 个 gap。整行排完 = `units*unit + (units-1)*gap`，**与这一行有几个键
+--- 无关**。旧公式写成 `units*unit + (#row-1)*gap`，把「键数」当成了「单位
+--- 数」，两者只要不相等就少算 `units - #row` 个 gap —— 旧布局 F 排
+--- units=15/#row=13，面板比内容窄 2×gap，最右一列键（F12/⌫/\ /⏎/⇧/→）
+--- 全都戳出面板背景之外。
 local function panelSize()
-    local units = 0
-    for _, k in ipairs(LAYOUT[1]) do units = units + k.w end
-    local w = units * M.unit + (#LAYOUT[1] - 1) * M.gap + M.pad * 2
+    local w = 0
+    for _, row in ipairs(LAYOUT) do
+        local units = 0
+        for _, k in ipairs(row) do units = units + k.w end
+        w = math.max(w, units * M.unit + (units - 1) * M.gap)
+    end
     local h = M.handleH + M.gap
         + #LAYOUT * M.keyH + (#LAYOUT - 1) * M.gap + M.pad * 2
-    return w, h
+    return w + M.pad * 2, h
 end
 
 local function rgba(hex, a)
@@ -240,8 +326,50 @@ local function isLetter(def)
     return def.k:find("^%a$") ~= nil
 end
 
+--- FN 换键层：FN 上膛后按这些键，发出的**不是**「fn+原键」而是换掉的键。
+---
+--- **为什么必须这样**（2026-10-05）：实体键盘上的 FN 是**固件层**的东西——
+--- 按下 FN+F1 时键盘自己就换了一个 HID usage 码发给电脑（F1 → 亮度减），
+--- macOS 从头到尾**没收到过「fn 修饰键」**，`fn` 只是系统事后补出来的一个
+--- 标志。而我们这种软件键盘只能发 CGEvent：给事件挂 `fn` 标志位，绝大多数
+--- App 直接忽略它（它们本来就没打算处理 fn），于是不管怎么点都没反应。
+--- 要让 FN 真有用，只能**在发送端就把键换掉**，模拟固件干的那件事。
+---
+--- 换键表照 Apple 的实际映射：F1/F2 亮度，F7~F9 媒体播放，F10~F12 音量，
+--- 以及 Mac 上 fn+方向键 = Home/End/PgUp/PgDn、fn+delete = 向前删除。
+--- F3~F6（调度中心/启动台/听写等）没有对应的系统键事件，只能原样透传。
+---
+--- `sys` = `hs.eventtap.event.newSystemKeyEvent` 的名字（媒体/亮度这类
+--- 特殊键只能走这条路，keyStroke 打不出它们）；`k` = 换成另一个普通键。
+local FN_MAP = {
+    f1 = { sys = "BRIGHTNESS_DOWN" }, f2 = { sys = "BRIGHTNESS_UP" },
+    f7 = { sys = "PREVIOUS" }, f8 = { sys = "PLAY" }, f9 = { sys = "NEXT" },
+    f10 = { sys = "MUTE" }, f11 = { sys = "SOUND_DOWN" },
+    f12 = { sys = "SOUND_UP" },
+    delete = { k = "forwarddelete" },   -- fn+Backspace = 向前删除（Mac 惯例）
+    left   = { k = "home" },  right  = { k = "end" },
+    up     = { k = "pageup" }, down  = { k = "pagedown" },
+}
+
 --- 发一个键。修饰键用 sticky 状态拼 mods 表，发完清空。
+---
+--- **M.armed 的初始化与这里的清空是同一份「修饰键清单」的两处副本**，
+--- 新增修饰键必须两处一起改（2026-10-05 加 fn 时就是这么做的）。
+---
+--- **为什么坚持整表重建、不用逐项置 false**：反向验证实测过——把 fn 从清空
+--- 表里漏掉，结果是 `M.armed.fn` 变成 **nil 而不是残留 true**，Lua 里 nil 是
+--- 假值，所以**并不会**「永久上膛粘住后面每个键」（我一开始在注释里这么写，
+--- 是错的）。整表重建把漏项的后果从「永久卡住」降级成「这个键用不了」，
+--- 这是它比逐项置 false 更稳的真正原因。代价是 `M.armed.fn == false` 这类
+--- 严格比较会失败（nil ~= false），测试里那条断言正是靠这个抓到漏项的。
 local function sendKey(def)
+    -- 组合键（⌘C/⌘V）：整组直发，**不掺 sticky 状态**——用户上着 ⇧ 时点
+    -- ⌘C，期望的仍然是拷贝而不是别的快捷键；发完照例清空 armed。
+    if def.combo then
+        hs.eventtap.keyStroke(def.combo.mods, def.combo.k, 0)
+        M.armed = { shift = false, ctrl = false, alt = false, cmd = false, fn = false }
+        return
+    end
     local mods = {}
     local shift = M.armed.shift
     if isLetter(def) and M.caps then shift = not shift end
@@ -249,13 +377,210 @@ local function sendKey(def)
     if M.armed.ctrl     then mods[#mods + 1] = "ctrl" end
     if M.armed.alt      then mods[#mods + 1] = "alt" end
     if M.armed.cmd      then mods[#mods + 1] = "cmd" end
+
+    -- FN 换键层：命中换键表就整组替换掉（见 FN_MAP 头注释里「为什么」）。
+    -- 其它 sticky 修饰键**保留**：真 Mac 上 fn+⇧+← 就是「选到行首」，
+    -- 换键不该把 ⇧ 吃掉。
+    if M.armed.fn and def.k and FN_MAP[def.k] then
+        local m = FN_MAP[def.k]
+        if m.sys then
+            hs.eventtap.event.newSystemKeyEvent(m.sys, true):post()
+            hs.eventtap.event.newSystemKeyEvent(m.sys, false):post()
+        else
+            hs.eventtap.keyStroke(mods, m.k, 0)
+        end
+        M.armed = { shift = false, ctrl = false, alt = false, cmd = false, fn = false }
+        return
+    end
+
+    -- 没命中换键表：仍然挂 fn 标志位发出去（原样透传，App 认不认看它自己）。
+    if M.armed.fn       then mods[#mods + 1] = "fn" end
     hs.eventtap.keyStroke(mods, def.k, 0)
-    M.armed = { shift = false, ctrl = false, alt = false, cmd = false }
+    M.armed = { shift = false, ctrl = false, alt = false, cmd = false, fn = false }
+end
+
+--- **实体 FN 事件的原始存档**（2026-10-05 探针实测拿到数据后才有的做法）。
+---
+--- 探针实测（`/tmp/hs-fn-probe.log`，Lin 用洛菲小顺按的）：
+---   keyDown       keyCode=0  key=a   flags=0x100              ← 普通键
+---   flagsChanged  keyCode=55 key=cmd flags=cmd  0x100108       ← ⌘ 走 flagsChanged
+---   systemDefined keyCode=0  key=a   flags=fn   0x800100       ← ★ 实体 FN
+---
+--- **实体 FN 走的是 `systemDefined`（NSEventTypeSystemDefined = 14）**，
+--- flags 里带 0x800000（NX_SECONDARYFNMASK）—— 光用 `flagsChanged` 造不出来，
+--- 而我们此前合成的 `newKeyEvent({"fn"}, "fn", …)` 是 keyDown + keyUp，
+--- **形态对不上**，这就是「点了没反应」的真正原因。
+--- （2026-10-05 第三轮补正：实体 FN **不是只有** systemDefined，它是「系统通道
+---  + 修饰键通道」两条一起来 —— 详见下面「一次实体 FN 敲击 = 一串事件」。）
+---
+--- `asData()` / `newEventFromData()` 让这件事有正解：**把实体事件原样录下来，
+--- 回放时原样重建**。好处是不必搞清楚 subtype / data1 / data2 到底是什么——
+--- 那几个值 Hammerspoon 的 `getRawEventData()` 根本没暴露。
+---
+--- 采集：设 `M.fnCaptureOn = true` 后 Reload，**慢慢按实体 FN 一下**（按下、停顿
+--- 一下、再松开）即自动存档。采完把 `M.fnCaptureOn` 设回 false（免得误覆盖）。
+M.fnDataPath  = os.getenv("HOME") .. "/.hammerspoon/fn-event.dat"
+M.fnCaptureOn = true     -- 采集期开着；拿到存档后设回 false
+
+--- **一次实体 FN 敲击 = 一串事件，不是「一个 down + 一个 up」**（2026-10-05 实测）。
+---
+--- 日志里一次「按下 → 松开」实际连发 4 条：
+---   ① systemDefined kc=0   flags=0x20800000   按下
+---   ② flagsChanged  kc=63  flags=0x20800000   按下（伴随，0.5ms 后）
+---   ③ systemDefined kc=0   flags=0x20000100   **抬起**（约 70ms 后）
+---   ④ flagsChanged  kc=63  flags=0x20000100   抬起（伴随）
+---
+--- 旧写法「一条按下一条抬起交替落位」，把 ② 当成了抬起 —— 存档是 down+down，
+--- 回放等于把 FN 按下去**再也不松手**，听写当然不理。破绽藏在间隔里：
+--- 存下来的 down→up 只有 **0.2ms**，人手做不到。
+--- ⇒ 判据改为只看 fn 标志位：**为 1 全归按下组、为 0 全归抬起组**，整串按原
+---   顺序原间隔回放。见 `record()` 里的采集段。
+local fnSeq = nil                        -- { {dir="D"/"U", data=<bytes>, ms=<距上一条>}, … }
+local fnSeqBase, fnSeqPrev, fnSeqClosing = nil, nil, nil   -- 仅采集期用
+
+--- **标记「接下来 0.3 秒内是自己发的」**。
+---
+--- 探针会把我们自己 post 出去的事件也录进去，而它跟实体按键长得几乎一样——
+--- 光看日志**根本分不清哪条是实体的、哪条是合成的**，这样 A/B 对照就废了
+--- （2026-10-05 第一次看日志就差点搞反）。发之前打这个戳，探针据此标注。
+local synthFnUntil = 0
+local function markSynthFn()
+    synthFnUntil = hs.timer.absoluteTime() + 3e8
+end
+
+local function hexOf(s)
+    return (s:gsub(".", function(c) return string.format("%02x", string.byte(c)) end))
+end
+local function unhex(h)
+    return (h:gsub("%x%x", function(p) return string.char(tonumber(p, 16)) end))
+end
+
+--- 存档格式（v2，文本可读）：一行 `#v2` 头，之后每行一条事件
+---   `D <hex> <距上一条毫秒>`  按下组
+---   `U <hex> <距上一条毫秒>`  抬起组
+--- 间隔照抄实体实测值：①~② 只有 0.x ms，①~③ 是真实按压时长（70ms 上下），
+--- 回放时一并还原才像真的。
+local function saveFnData()
+    if not (fnSeq and #fnSeq >= 2) then return end
+    local f = io.open(M.fnDataPath, "w")
+    if not f then return end
+    f:write("#v2 实体 FN 一次敲击的事件序列：D=按下 U=抬起，数字=距上一条毫秒\n")
+    for _, e in ipairs(fnSeq) do
+        f:write(string.format("%s %s %.1f\n", e.dir, hexOf(e.data), e.ms or 0))
+    end
+    f:close()
+end
+
+local function loadFnData()
+    local f = io.open(M.fnDataPath, "r")
+    if not f then return end
+    local seq = {}
+    for line in f:lines() do
+        local dir, hex, ms = line:match("^(%a) (%x+) ([%d%.]+)$")
+        if dir and hex then
+            local d = unhex(hex)
+            if d and #d > 0 then
+                seq[#seq + 1] = { dir = dir, data = d, ms = tonumber(ms) or 0 }
+            end
+        end
+    end
+    f:close()
+    -- **必须按下组、抬起组都有**：只有一半的存档（down+down / up+up）用起来
+    -- 等于「按住不松」或「空抬」，比没有存档更糟 —— 宁可退回手工合成。
+    local hasD, hasU = false, false
+    for _, e in ipairs(seq) do
+        if e.dir == "D" then hasD = true elseif e.dir == "U" then hasU = true end
+    end
+    if hasD and hasU then fnSeq = seq end
+end
+pcall(loadFnData)
+
+--- 有没有拿到实体 FN 的存档（诊断用，控制台 `hs.osk.fnDataStatus()`）
+function M.fnDataStatus()
+    local nD, nU = 0, 0
+    for _, e in ipairs(fnSeq or {}) do
+        if e.dir == "D" then nD = nD + 1 elseif e.dir == "U" then nU = nU + 1 end
+    end
+    return string.format("capture=%s 序列=%d条(按下%d/抬起%d) path=%s",
+        tostring(M.fnCaptureOn), fnSeq and #fnSeq or 0, nD, nU, M.fnDataPath)
+end
+
+--- 重读存档（换键盘、或刚录完不想 Reload 整个 config 时用）。
+--- 先清再加：坏档（只有按下没有抬起的那种）不会被采纳，FN 退回手工合成，
+--- 不会因为有半个档就变成死键。
+function M.fnReload()
+    fnSeq = nil
+    pcall(loadFnData)
+    return M.fnDataStatus()
+end
+
+--- **真按一次 fn 键**（按下 + 抬起）。
+---
+--- **为什么 FN 光「上膛」还不够**：上膛只是改了我们自己的 `M.armed`，一个键也
+--- 没发出去。那些「连按两次 Fn」类的系统快捷键（macOS 听写默认就有这一项：
+--- 系统设置 → 键盘 → 听写 → 快捷键 →「按 Fn 键两次」）因此永远触发不了——
+--- 用户点两下 FN，系统一次 fn 按下都没收到。实体键盘每按一次 Fn 都是一次
+--- 真实的「fn 按下 + 抬起」，所以这里照做：**点一下 = 真按一次，连点两下 =
+--- 真按两次 = 双击 Fn**，听写那类快捷键就能触发了。
+---
+--- **为什么不用 `hs.eventtap.keyStroke({"fn"}, "fn")`**：keyStroke 会把同一份
+--- mods 同时用在按下和抬起两个事件上（见 eventtap.lua 源码 275/277 行），
+--- 拿它发修饰键的话，**抬起事件里 fn 标志位仍然是 1**，系统认为 fn 一直按着没松。
+--- 所以必须手工发：按下带 fn 标志位、抬起清空标志位。
+---
+--- **有实体存档时整串原样回放**（形态一致，这是唯一能对上系统检测的做法）；
+--- 没有存档才退回手工合成的合成事件（形态不对，但至少不是死键）。
+---
+--- pcall 包住是因为 posting 在 tap 回调里，抛异常会让系统禁用整个 tap。
+---
+--- 回放按存档里的实测间隔走：组内 0.x ms 的连发**直接接着发**（排 doAfter 反而
+--- 被定时器的几毫秒粒度拉歪），组间 70ms 那种才真的等一下。
+local function playFnSeq()
+    if not (fnSeq and #fnSeq > 0) then return false end
+    -- 先造第一条：造不出来说明存档跟这台机器对不上（换过键盘/系统升级过），
+    -- 立刻返回 false 让 tapFnKey 退回手工合成，别让 FN 变死键。
+    -- **造出来就留着用**：拿它探完再扔、回放时又造一遍，等于同一条事件造两次。
+    local okFirst, first = pcall(function()
+        return hs.eventtap.event.newEventFromData(fnSeq[1].data)
+    end)
+    if not okFirst or not first then return false end
+    local i = 0
+    local step
+    step = function()
+        i = i + 1
+        local e = fnSeq[i]
+        if not e then return end
+        pcall(function()
+            markSynthFn()
+            local ev = (i == 1) and first or hs.eventtap.event.newEventFromData(e.data)
+            if ev then ev:post() end
+        end)
+        if i < #fnSeq then
+            local d = fnSeq[i + 1].ms or 0
+            if d >= 5 then hs.timer.doAfter(d / 1000, step) else step() end
+        end
+    end
+    step()
+    return true
+end
+
+local function tapFnKey()
+    -- 有存档且回放成功就完事；存档缺失/不可用（playFnSeq 返回 false）或回放
+    -- 本身抛错，都退回手工合成，别让 FN 变成死键。
+    local ok, played = pcall(playFnSeq)
+    if ok and played then return end
+    pcall(function()
+        markSynthFn()
+        hs.eventtap.event.newKeyEvent({ "fn" }, "fn", true):post()
+        hs.eventtap.event.newKeyEvent({}, "fn", false):post()
+    end)
 end
 
 --- 键帽当前该显示什么：字母看 caps/shift，其它看 shift 层定义。
 local function labelFor(def)
-    if def.mod or def.special then return def.t end
+    -- combo 键的 k 是 nil（防止误当普通键发出去），必须先挡掉，
+    -- 否则下面 isLetter 的 def.k:find 会崩。
+    if def.combo or def.mod or def.special then return def.t end
     if isLetter(def) then
         return (M.armed.shift ~= M.caps) and def.t:upper() or def.t
     end
@@ -332,6 +657,9 @@ local function pressKey(k)
     M._pressing = k
     local def = k.def
     if def.mod then
+        -- FN 除了上膛还要**真的发一次 fn 键**：只上膛不发键的话，「连按两次
+        -- Fn」这类系统快捷键（听写）永远触发不了。见 tapFnKey 头注释。
+        if def.mod == "fn" then tapFnKey() end
         M.armed[def.mod] = not M.armed[def.mod]
     elseif def.special == "caps" then
         M.caps = not M.caps
@@ -1417,32 +1745,35 @@ local function build(x, y)
         local ux = M.pad
         local ky = M.pad + M.handleH + M.gap + (row - 1) * (M.keyH + M.gap)
         for ci, def in ipairs(rowKeys) do
-            def.id = "k" .. row .. "_" .. ci
             local kw = def.w * M.unit + (def.w - 1) * M.gap
-            idx = idx + 1
-            elems[idx] = {
-                type = "rectangle",
-                id = def.id,
-                action = "fill",
-                frame = { x = ux, y = ky, w = kw, h = M.keyH },
-                fillColor = def.mod and C.modKey or C.key,
-                roundedRectRadii = { xRadius = 5, yRadius = 5 },
-            }
-            local rectIdx = idx
-            idx = idx + 1
-            elems[idx] = {
-                type = "text",
-                id = def.id .. "_t",
-                text = labelFor(def),
-                textSize = M.textSize,
-                textColor = C.text,
-                textAlignment = "center",
-                frame = { x = ux, y = ky + (M.keyH - M.textSize) / 2 - 1, w = kw, h = M.textSize + 4 },
-            }
-            M._keys[#M._keys + 1] = {
-                def = def, rect = rectIdx, text = idx, pressed = false,
-                cx = ux, cy = ky, cw = kw, ch = M.keyH,
-            }
+            -- 留白：只把 x 往前推，不画键、不进命中表
+            if not def.spacer then
+                def.id = "k" .. row .. "_" .. ci
+                idx = idx + 1
+                elems[idx] = {
+                    type = "rectangle",
+                    id = def.id,
+                    action = "fill",
+                    frame = { x = ux, y = ky, w = kw, h = M.keyH },
+                    fillColor = def.mod and C.modKey or C.key,
+                    roundedRectRadii = { xRadius = 5, yRadius = 5 },
+                }
+                local rectIdx = idx
+                idx = idx + 1
+                elems[idx] = {
+                    type = "text",
+                    id = def.id .. "_t",
+                    text = labelFor(def),
+                    textSize = M.textSize,
+                    textColor = C.text,
+                    textAlignment = "center",
+                    frame = { x = ux, y = ky + (M.keyH - M.textSize) / 2 - 1, w = kw, h = M.textSize + 4 },
+                }
+                M._keys[#M._keys + 1] = {
+                    def = def, rect = rectIdx, text = idx, pressed = false,
+                    cx = ux, cy = ky, cw = kw, ch = M.keyH,
+                }
+            end
             ux = ux + kw + M.gap
         end
     end
@@ -1633,5 +1964,257 @@ _G.hsOnScreenKeyboard = M
 --- 也就是说：**要让记账生效，就必须让它一直在跑**，而不是「用的时候才开」。
 --- 这和「要连按两次键盘才生效」是同一个病根的最后一层。
 pcall(M.ensureMousePoll)
+
+-- ============================================================================
+-- FN 真机探针（2026-10-05）
+--
+-- 存在的理由：实体键盘的 FN 是**固件层换键**——按 FN 时键盘自己换 HID usage
+-- 码，macOS 可能只收到一条 flagsChanged、也可能**一条都收不到**。在没有实测
+-- 数据之前，屏幕上这个 FN 按钮该怎么实现只能靠猜（我已经猜错两次了）。
+--
+-- 这个探针就是把猜测换成数据：录下按键时系统实际收到的事件类型、keyCode、
+-- flags（含原始数值）。**只记 keyCode 和 flags，不记字符**——避免把密码写进日志。
+--
+-- 用法：设 M.probeSeconds > 0 后 Reload Config，探针在模块加载时自动启动；
+--       或在控制台手动 `hs.osk.fnProbe(120)` / `hs.osk.fnProbeStop()`。
+-- 日志落在 M.probeLog。**放在仓库里而不是 /tmp**：诊断日志的第一读者是人，
+-- 藏在 /tmp 里等于没写（2026-10-05 Lin 找不着它）。
+-- ============================================================================
+M.probeLog     = os.getenv("HOME") .. "/.hammerspoon/.workbuddy/hs-fn-probe.log"
+M.probeSeconds = 120     -- 自动录这么久；平时设 0 关掉
+
+do
+    local tap, lastMs, nRec = nil, nil, 0
+    local MAXREC = 500    -- 到量自动停，别把日志写爆
+
+    --- keyCode -> 键名 的反查表（hs.keycodes.map 是 名字->keyCode，要反过来）
+    local codeName = nil
+    local function nameOf(code)
+        if code == nil then return "-" end
+        if not codeName then
+            codeName = {}
+            local ok, m = pcall(function() return hs.keycodes.map end)
+            if ok and type(m) == "table" then
+                for k, v in pairs(m) do
+                    if type(v) == "number" then
+                        codeName[v] = tostring(k)
+                    elseif type(k) == "number" then
+                        codeName[k] = tostring(v)
+                    end
+                end
+            end
+        end
+        return codeName[code] or ("?" .. tostring(code))
+    end
+
+    local typeNames = nil
+    local function typeOf(t)
+        if not typeNames then
+            typeNames = {}
+            local ok, ts = pcall(function() return hs.eventtap.event.types end)
+            if ok and type(ts) == "table" then
+                for k, v in pairs(ts) do
+                    if type(v) == "number" then typeNames[v] = tostring(k) end
+                end
+            end
+        end
+        return typeNames[t] or tostring(t)
+    end
+
+    local function dumpTbl(t, maxKeys)
+        if type(t) ~= "table" then return tostring(t) end
+        local parts, n = {}, 0
+        for k, v in pairs(t) do
+            n = n + 1
+            if n > maxKeys then parts[#parts + 1] = "…"; break end
+            local vs
+            if type(v) == "table" then
+                vs = "{tbl}"
+            elseif type(v) == "number" then
+                vs = string.format("0x%x", math.floor(v))
+            else
+                vs = tostring(v)
+            end
+            parts[#parts + 1] = tostring(k) .. "=" .. vs
+        end
+        table.sort(parts)
+        return table.concat(parts, " ")
+    end
+
+    local function plog(fmt, ...)
+        local ok, msg = pcall(string.format, fmt, ...)
+        if not ok then msg = fmt end
+        local f = io.open(M.probeLog, "a")
+        if f then
+            f:write(os.date("%F %T ") .. tostring(msg) .. "\n")
+            f:close()
+        end
+    end
+
+    --- 回调里**任何异常都会让整个 tap 静默停掉**，所以每一步都包 pcall。
+    local function record(ev)
+        local ok, err = pcall(function()
+            local ms = hs.timer.absoluteTime() / 1e6
+            local dt = lastMs and string.format("+%6.1fms", ms - lastMs) or "    首条"
+            lastMs = ms
+
+            local tName = typeOf(ev:getType())
+            local kc    = ev:getKeyCode()
+            local flags, flagsTbl = "?", nil
+            pcall(function()
+                local f = ev:getFlags()
+                if type(f) == "table" then
+                    flagsTbl = f
+                    local p = {}
+                    for _, nm in ipairs({ "cmd", "ctrl", "alt", "shift", "fn" }) do
+                        if f[nm] then p[#p + 1] = nm end
+                    end
+                    flags = #p == 0 and "-" or table.concat(p, "+")
+                end
+            end)
+
+            -- 原始 CGEventData：键名不确定，整表 dump 出来看全貌
+            local raw, rawFlags = "-", nil
+            pcall(function()
+                local d = ev:getRawEventData()
+                if type(d) == "table" and type(d.CGEventData) == "table" then
+                    -- **flags 的原始数值**，采集判据要用：`flagsTbl` 只能看出
+                    -- 「fn 位在不在」，看不出「整条 flags 是不是 0」——而背景
+                    -- 噪声（不按键时也在发的 systemDefined flags=0x0）和被
+                    -- 抬起的 FN（systemDefined 0x20000100）在 flagsTbl 里长得
+                    -- 一模一样，只能靠原始数值分开。
+                    local f = d.CGEventData.flags
+                    if type(f) == "number" then rawFlags = f end
+                    raw = dumpTbl(d.CGEventData, 14)
+                end
+            end)
+
+            local isSynth = hs.timer.absoluteTime() < synthFnUntil
+            local tag = ""
+            if flagsTbl and flagsTbl.fn then
+                tag = isSynth and "  ← 我们自己发的" or "  ← 实体键盘"
+            end
+            plog("%-14s %-13s keyCode=%-4s key=%-12s flags=%-18s%s | %s",
+                tName, dt, tostring(kc), nameOf(kc), flags, tag, raw)
+
+            -- **FN 采集**：按 **fn 标志位**分组，不是「一条按下一条抬起交替」。
+            --
+            -- 实体一次敲击连发 4 条（按下 2 条 + 抬起 2 条，见 fnSeq 处注释），
+            -- 交替落位会把第 2 条按下当成抬起，存出 down+down 的废档
+            -- （2026-10-05 第三轮就栽在这，破绽是 down→up 只有 0.2ms）。
+            -- fn 位为 1 → 按下组；为 0 且在一次敲击之中 → 抬起组。抬起来过之后
+            -- 等 0.4 秒收尾存档，期间不再收新按下（免得把下一敲混进这一串）。
+            --
+            -- 只采实体的：合成的事件自己也看得到，采它等于自我循环。
+            if M.fnCaptureOn and not isSynth and flagsTbl
+                and (tName == "systemDefined" or tName == "flagsChanged") then
+                -- **flags 原始值为 0 = 背景噪声，一律不收**：那种 systemDefined
+                -- 全程都在发（约 1~3 秒一对，不按键也有），混进存档等于在「按下」
+                -- 和「抬起」之间插几条无关事件，回放就不是实体那串了。
+                local noise = (type(rawFlags) == "number" and rawFlags == 0)
+                local isFnDown = (flagsTbl.fn == true) and not fnSeqClosing
+                local isFnUp = (not flagsTbl.fn) and (fnSeqBase ~= nil) and not noise
+                    and (kc == 63 or (tName == "systemDefined" and kc == 0))
+                if isFnDown or isFnUp then
+                    pcall(function()
+                        local data = ev:asData()
+                        if type(data) == "string" and #data > 0 then
+                            local now = hs.timer.absoluteTime() / 1e6
+                            if not fnSeqBase then
+                                fnSeq, fnSeqBase, fnSeqPrev = {}, now, nil
+                            end
+                            local ms = fnSeqPrev and (now - fnSeqPrev) or 0
+                            local msTxt = fnSeqPrev and string.format("%.1fms", ms) or "—"
+                            fnSeq[#fnSeq + 1] = {
+                                dir = isFnDown and "D" or "U", data = data, ms = ms,
+                            }
+                            fnSeqPrev = now
+                            plog("★ 捕获实体 FN %s（%d 字节，距上一条 %s）",
+                                isFnDown and "按下" or "抬起", #data, msTxt)
+                            if isFnUp and not fnSeqClosing then
+                                fnSeqClosing = true
+                                hs.timer.doAfter(0.4, function()
+                                    saveFnData()
+                                    local nD, nU = 0, 0
+                                    for _, e in ipairs(fnSeq or {}) do
+                                        if e.dir == "D" then nD = nD + 1 else nU = nU + 1 end
+                                    end
+                                    M.fnCaptureOn = false
+                                    fnSeqBase, fnSeqPrev, fnSeqClosing = nil, nil, nil
+                                    plog("★ 一次敲击采集完成：%d 条（按下%d/抬起%d），"
+                                        .. "已存档并自动关闭", #(fnSeq or {}), nD, nU)
+                                end)
+                            end
+                        end
+                    end)
+                end
+            end
+        end)
+        if not ok then
+            plog("!! 探针回调出错（已拦下，不影响按键）: %s", tostring(err))
+        end
+        nRec = nRec + 1
+        if nRec >= MAXREC then
+            plog("=== 达到 %d 条上限，自动停止 ===", MAXREC)
+            if tap then tap:stop(); tap = nil end
+        end
+    end
+
+    function M.fnProbeStop()
+        if tap then tap:stop(); tap = nil end
+        lastMs = nil
+        plog("=== 探针手动停止 ===")
+    end
+
+    --- 录 seconds 秒。返回是否真的启动成功。
+    function M.fnProbe(seconds)
+        if tap then M.fnProbeStop() end
+        local types = {}
+        for _, nm in ipairs({ "flagsChanged", "keyDown", "keyUp", "systemDefined" }) do
+            local v = hs.eventtap.event.types[nm]
+            if v then types[#types + 1] = v end
+        end
+        if #types == 0 then
+            plog("!! 拿不到事件类型常量，探针未启动")
+            return false
+        end
+        nRec, lastMs = 0, nil
+        local ok, t = pcall(function()
+            return hs.eventtap.new(types, function(ev)
+                record(ev)
+                return false    -- 一律不吞事件，探针只观察
+            end)
+        end)
+        if not ok or not t then
+            plog("!! hs.eventtap.new 失败：%s（多半是没给「输入监控」权限）", tostring(t))
+            return false
+        end
+        tap = t
+        local ok2, err2 = pcall(function() tap:start() end)
+        if not ok2 then
+            plog("!! tap:start() 抛错：%s", tostring(err2))
+            tap = nil
+            return false
+        end
+        plog("=== 探针启动，录 %.0f 秒 ===", tonumber(seconds) or 0)
+        hs.timer.doAfter(tonumber(seconds) or 60, function()
+            if tap then tap:stop(); tap = nil end
+            plog("=== 探针到点停止 ===")
+        end)
+        return true
+    end
+
+    -- 延迟 1 秒再挂 tap：① 避开模块加载瞬间的初始化抖动；
+    -- ② **测试环境里 doAfter 桩件不自动跑回调**，于是探针在测试中根本不会
+    --    启动，不会往真机日志里写一行「启动失败」把它污染掉
+    --    （诊断日志被污染 = 诊断日志失效，这在别处已经栽过一次）。
+    if (M.probeSeconds or 0) > 0 then
+        pcall(function()
+            hs.timer.doAfter(1, function()
+                pcall(M.fnProbe, M.probeSeconds)
+            end)
+        end)
+    end
+end
 
 return M

@@ -1,3 +1,5 @@
 .workbuddy/*
 hammerspoon.code-workspace
+# 实体 FN 键事件的原始存档（osk 采集生成，换键盘就失效，不入库）
+fn-event.dat
 

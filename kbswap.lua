@@ -35,9 +35,54 @@ local M = {}
 
 M.engine       = "hidutil"  -- "hidutil" 只换蓝牙键盘 | "eventtap" 全局交换（旧方案，兜底）
 M.mode         = "auto"     -- "auto" 跟随蓝牙键盘 | "off" 停用（eventtap 另有 "on" 强制交换）
-M.pollInterval = 5          -- 检测间隔（秒）
+--- 状态变迁日志。**只记变化**（设备出现/消失、下发成败、读回发现映射被收走），
+--- 不记每轮 —— 轮询 2 秒一次，记全程一天就是几万行。防呆是取巧：打开调试输出的人
+--- 自己看得见，落盘的这份是给「事情已经过去、只能看日志」准备的。
+--- 为什么放仓库里而不是 /tmp：Lin 找不到的日志等于没写（2026-10-05 的教训）。
+--- 日志路径可注入（M.logPath），测试里要存旧值再还原。
+M.logPath    = os.getenv("HOME") .. "/.hammerspoon/.workbuddy/kbswap.log"
+M.logMaxBytes = 512 * 1024    -- 超了就整份重写。诊断日志不需要跨天历史
+
+--- 写一行状态变迁日志。**绝不能抛**：诊断函数把功能搞挂是最讽刺的死法
+--- （2026-10-05 在 osk 的 diag() 上真发生过）。所以整段 pcall。
+local function plog(fmt, ...)
+    if not M.logPath then return end
+    -- 格式化放在 pcall 外面：`...`（变长参数）在非 vararg 函数里不可用。
+    -- 顺带满足「诊断绝不该抛」——格式化失败就把 fmt 原样写进去。
+    local msg = tostring(fmt)
+    if select("#", ...) > 0 then
+        local ok, formatted = pcall(string.format, tostring(fmt), ...)
+        if ok then msg = formatted end
+    end
+    pcall(function()
+        -- 年份必须带上：只写「10-17」会被读成 2010 年，排查时先要愣一下（Lin 2026-10-17）
+        local stamp = os.date("%Y-%m-%d %H:%M:%S")
+        -- 超限先清空：append 打开时拿不到大小，退而用「写完再判」
+        local f = io.open(M.logPath, "a")
+        if not f then return end
+        f:write(stamp, "  ", msg, "\n")
+        f:close()
+        local probe = io.open(M.logPath, "r")
+        if probe then
+            local big = #probe:read("*a") > M.logMaxBytes
+            probe:close()
+            if big then
+                local w = io.open(M.logPath, "w")
+                if w then
+                    w:write(stamp, "  （日志超限，已截断）\n")
+                    w:close()
+                end
+            end
+        end
+    end)
+end
+
+M._plog = plog   -- 暴露给测试与排障（直接验证「格式化失败也不抛」这类边界）
+
+M.pollInterval = 2          -- 检测间隔（秒）。5 秒偏慢：蓝牙键盘重连后的空窗体感明显
 M.profilerTTL  = 30         -- system_profiler 结果的缓存时间（秒），它是唯一慢的一环
-M.reassert     = 60         -- 每隔多久重挂一次映射（秒）。防休眠唤醒后映射悄悄失效
+M.reassert     = 60         -- ⚠️ 已不再参与判定（2026-10-17）。原为「每隔多久重挂一次
+                             -- 映射」的兜底，现由每轮读回验证取代。留着只为兼容旧配置。
 M.swapRight    = true       -- 是否连右侧 ⌥/⌘（usage 0xE6/0xE7）一起换
 M.notify       = true       -- 蓝牙键盘连接/断开时弹提示
 M.msgConnected    = "Keyboard connected: %s"    -- %s = 设备名（拿不到时自动去掉分隔符）
@@ -450,12 +495,79 @@ end
 --- key -> { target, matcher, sig, at }
 local applied = {}
 
---- 给一把键盘挂上交换。已经挂过且设备没有重新枚举就直接返回，不重复下发。
+--- 按设备把 hidutil 读回的属性文本拆开，收集每台设备上的**十进制数值**。
+--- 为什么要拆：Transport 兜底匹配会同时命中键盘和蓝牙鼠标，读回的输出里两台设备
+--- 各带一份映射。只看「值在不在」会把**鼠标**的映射当成键盘的 —— 键盘其实没挂上，
+--- 却被判成「还挂着」，于是永远不重挂。
+--- ⚠️ 行级解析里 Src 和 Dst 是**两行**（`{ ...Dst = x; ...Src = y; }`），
+--- 所以不能沿用 parseMapping 那种 `if src and dst` 的配对写法 —— 它永远为假，
+--- 一条都收集不到（2026-10-17 踩过，症状是「读回永远判定为没挂上」→ 每轮重复下发）。
+--- @param out string
+--- @return table 形如 { ["1000256da"] = { 30064771299, 30064771298, ... }, ... }
+local function parseMappingByDevice(out)
+    local byDev, cur = {}, nil
+    for line in tostring(out):gmatch("[^\r\n]+") do
+        local regid = line:match("^%s*(%x+)%s+UserKeyMapping")
+        if regid then
+            cur = byDev[regid] or {}
+            byDev[regid] = cur
+        elseif cur then
+            local v = line:match("HIDKeyboardModifierMapping%a+%s*=%s*(%d+)")
+            if v then cur[#cur + 1] = tonumber(v) end
+            if line:find(")", 1, true) then cur = nil end   -- 空映射 "(\n)" 的收尾
+        end
+    end
+    return byDev
+end
+
+--- 这把设备上我们自己那套映射现在还在吗？
+--- ⚠️ 必须按「这台设备自己的 RegistryID」逐台查：Transport 兜底匹配一次会命中
+--- 同一传输下的所有蓝牙设备，读回的输出里混着别人的映射。
+--- @param rec table applied 里的记录
+--- @return boolean
+local function mappingStillOn(rec)
+    local out = runHidutil(rec.matcher, nil, "UserKeyMapping")
+    local byDev = parseMappingByDevice(out)
+
+    local want, need = {}, 0
+    for _, v in ipairs(expectedDecimals()) do
+        want[v] = true
+        need = need + 1
+    end
+
+    for _, regid in ipairs(rec.target.regids or {}) do
+        local vals = byDev[string.format("%x", tonumber(regid) or 0)]
+        if vals and #vals > 0 then
+            local seen, cnt, allOurs = {}, 0, true
+            for _, v in ipairs(vals) do
+                if not seen[v] then seen[v] = true; cnt = cnt + 1 end
+            end
+            for v in pairs(seen) do
+                if not want[v] then allOurs = false end
+            end
+            -- 一条都不能多（多的说明这是别人设的映射），一条都不能少
+            if allOurs and cnt >= need then return true end
+        end
+    end
+
+    plog("读回发现 %s 上的映射不在了（键盘重连 / 休眠唤醒都会这样）→ 本轮立刻重挂",
+        tostring(rec.target.name))
+    return false
+end
+
+--- 给一把键盘挂上交换。
+--- ⚠️ 判定「已经挂好」只有一个依据：**把设备上的映射读回来核对**。
+--- 它取代了原来的时间判据（`sig 没变 + 距上次不到 reassert`），那个判据会错满
+--- reassert（60 秒）——映射随键盘服务移除而丢失，而同一把键盘重连后的
+--- IORegistryEntryID 常常一模一样，于是「已经下发过」长期成立不了。
+--- 读回也取代了 reassert 的兜底重挂：**每 2 秒就核对一次**，休眠唤醒这类场景在
+--- 两秒内就会被发现并重挂，没必要再每分钟无谓地重写一遍 HID 属性
+--- （2026-10-17 实测：那每 60 秒一次的「已下发」让日志全是噪音）。
 --- @param t table 设备描述
 --- @return boolean 是否处于「已挂上」状态
 local function applyTarget(t)
     local rec = applied[t.key]
-    if rec and rec.sig == t.sig and (os.time() - rec.at) < M.reassert then
+    if rec and rec.sig == t.sig and mappingStillOn(rec) then
         return true
     end
 
@@ -471,6 +583,7 @@ local function applyTarget(t)
         if ok and valueOK and deviceOK then
             applied[t.key] = { target = t, matcher = m, sig = t.sig, at = os.time() }
             M.lastError = nil
+            plog("已下发 ⇄ -> %s（%s）", tostring(t.name), m)
             if M.debug then
                 print(string.format("[kbswap] 已下发 -> %s（%s）", tostring(t.name), m))
             end
@@ -486,6 +599,7 @@ local function applyTarget(t)
     end
 
     M.lastError = "无法向 " .. tostring(t.name) .. " 下发映射"
+    plog("%s（本轮失败，下一轮重试）", M.lastError)
     print("[kbswap] " .. M.lastError)
     return false
 end
@@ -618,6 +732,10 @@ local function statusLine()
         state = "已停用"
     elseif M.active then
         state = "已交换" .. (M.lastDevice and ("：" .. M.lastDevice) or "")
+    elseif M.lastError then
+        -- 有设备却挂不上时，状态行必须说「失败」。旧版一律写「待机（无蓝牙键盘）」，
+        -- 于是真出问题那天，图标看着正常、tooltip 却谎报没键盘 —— 排查时等于没有线索。
+        state = "下发失败：" .. M.lastError
     elseif M.engine == "hidutil" then
         state = "待机（无蓝牙键盘）"
     else
@@ -730,10 +848,31 @@ local function shouldApply()
     return #M.targets > 0
 end
 
+--- 上一轮出现过的目标 key、以及「曾经消失过」的 key 集合。
+--- 设备从 HID 列表里消失 = 它的 HID 服务被移除过 = 映射必然丢失。所以下次出现时
+--- 无论 regid 变没变，都必须重挂——这一条和时间无关，是 HID 层的物理事实。
+local lastTargetKeys, goneKeys = {}, {}
+
 --- hidutil 引擎的一轮：发现设备 -> 下发/撤销 -> 广播状态变化。
 local function tickHidutil()
     local listOut = hs.execute(HIDUTIL .. " list --ndjson 2>&1")
     M.targets = filterTargets(aggregate(parseHidList(listOut)))
+
+    -- ① 差集：上一轮在、本轮不在 ⇒ 这台设备的映射已经随服务移除而没了
+    local nowKeys = {}
+    for _, t in ipairs(M.targets) do nowKeys[t.key] = true end
+    for key in pairs(lastTargetKeys) do
+        if not nowKeys[key] and not goneKeys[key] then
+            goneKeys[key] = true
+            plog("目标离开：%s（HID 服务被移除，映射随之丢失）", key)
+        end
+    end
+
+    -- ② 「重新出现」的强制重挂**不需要单独写**：下一段的读回验证会自动发现
+    -- 映射没了（HID 服务重建后属性就是空的）并重挂。2026-10-17 反向验证时发现，
+    -- 专门记 goneKeys 再清 applied 的那段是冗余的——注回它测试照样全绿。
+    lastTargetKeys = nowKeys
+    goneKeys = {}
 
     if shouldApply() then
         local okCount = 0
@@ -742,9 +881,11 @@ local function tickHidutil()
         end
         M.active = okCount > 0
         M.lastDevice = M.targets[1] and M.targets[1].name or nil
+        if M.active then M.lastError = nil end   -- 至少一把挂上了就别再顶着旧错误
     else
         clearAll()
         M.active = false
+        M.lastError = nil                        -- 设备都没了，失败原因也该跟着清
     end
 end
 
