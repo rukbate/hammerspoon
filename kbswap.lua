@@ -160,7 +160,11 @@ local function hitDevice(out, t)
     if type(out) ~= "string" or not out:find("%S") then return false end
     if #t.regids == 0 then return true end
 
-    local flat = " " .. out:gsub("%s+", " ") .. " "
+    -- 归一化后再找（2026-10-18 加）：输出格式漂移（大写 / 0x 前缀）时
+    -- 原样小写比对会恒假，症状是「映射照常每轮写上，但状态行说没挂上」。
+    -- 做法：整体小写 + 删掉所有 "0x" 子串。十进制数值只含 0-9（没有 x），
+    -- 不受影响；十六进制 regid 无论大小写、带不带前缀都落到同一格式。
+    local flat = " " .. out:lower():gsub("0x", ""):gsub("%s+", " ") .. " "
     for _, regid in ipairs(t.regids) do
         local hex = string.format("%x", tonumber(regid) or 0)
         if flat:find(" " .. hex .. " ", 1, true) then return true end
@@ -383,8 +387,10 @@ end
 
 --- system_profiler 的设备分类缓存。它是唯一慢的一环（约 0.2s），
 --- 只在需要时异步刷新：eventtap 引擎每轮都刷，hidutil 引擎按 profilerTTL 刷。
+--- `failed` 记 task 失败次数：tickHidutil 靠它区分「还没回来」（继续等）和
+--- 「回来了但拿不到」（按老逻辑走，宁可换错也不漏键盘）。
 --- @type table
-local profilerCache = { at = 0, byName = {}, keyboardNames = {}, pending = false }
+local profilerCache = { at = 0, byName = {}, keyboardNames = {}, pending = false, failed = 0 }
 
 --- 解析 system_profiler 的蓝牙设备树。
 --- 输出形如（缩进代表层级，设备名行以冒号结尾）：
@@ -451,6 +457,9 @@ local function refreshProfiler(force)
         profilerCache.pending = false
         if code ~= 0 or not out then
             -- 拿不到分类信息不算致命：宁可多认几个设备，也不漏掉真键盘
+            -- 记一次失败：tickHidutil 靠它决定「还要不要继续等缓存」
+            -- （无限等下去 = 永远不交换，比换错更糟）。
+            profilerCache.failed = (profilerCache.failed or 0) + 1
             if M.debug then print("[kbswap] system_profiler 失败，退出码 " .. tostring(code)) end
             return
         end
@@ -504,17 +513,40 @@ local applied = {}
 --- 一条都收集不到（2026-10-17 踩过，症状是「读回永远判定为没挂上」→ 每轮重复下发）。
 --- @param out string
 --- @return table 形如 { ["1000256da"] = { 30064771299, 30064771298, ... }, ... }
+--- 按设备把 hidutil 读回的属性文本拆开。
+--- 为什么要拆：Transport 兜底匹配会同时命中键盘和蓝牙鼠标，读回的输出里两台设备
+--- 各带一份映射。只看「值在不在」会把**鼠标**的映射当成键盘的 —— 键盘其实没挂上，
+--- 却被判成「还挂着」，于是永远不重挂。
+--- 输出形如：`1000256da   UserKeyMapping   ( { .. } )`，空映射是 `( )`。
+---
+--- **归一化**（2026-10-18 加）：regid 统一成「小写、无 0x 前缀」再当 key。
+--- macOS 更新改了输出格式（大写十六进制 / 加 0x 前缀）不会让交换失效，但会让
+--- deviceOK 恒假 → applyTarget 永远记不上 → 状态行谎报 false、每 2 秒刷一条错误。
+--- 格式漂移时日志里也看不出原因，所以 applyTarget 的失败路径会把原始输出截一段
+--- 写进 plog（见那边）。
+--- @param out string
+--- @return table 形如 { ["1000256da"] = { {src=..., dst=...}, ... }, ... }
 local function parseMappingByDevice(out)
     local byDev, cur = {}, nil
     for line in tostring(out):gmatch("[^\r\n]+") do
-        local regid = line:match("^%s*(%x+)%s+UserKeyMapping")
+        -- lower + 容忍 0x 前缀：查询端（hitDevice / mappingStillOn）用的 key 是
+        -- string.format("%x", regid)（小写无前缀），两边必须落在同一格式上。
+        local raw = line:lower():match("^%s*(0?x?[%x]+)%s+userkeymapping")
+        local regid = raw and raw:gsub("^0x", "") or nil
         if regid then
             cur = byDev[regid] or {}
             byDev[regid] = cur
         elseif cur then
             local v = line:match("HIDKeyboardModifierMapping%a+%s*=%s*(%d+)")
             if v then cur[#cur + 1] = tonumber(v) end
-            if line:find(")", 1, true) then cur = nil end   -- 空映射 "(\n)" 的收尾
+            -- **只有「整行只有一个 )」才是段收尾**。旧判据是 `find(")")`，
+            -- 它会把每对映射的收尾行 `    },` 也当成段结束 —— 于是每台设备
+            -- 只收得到**第一对**的值，第二对起全部丢失（2026-10-18 修）。
+            -- 后果：allOurs 漏检第二对（别人的映射混在后面也发现不了）、
+            -- mappingStillOn 的「一条都不能多」检查形同虚设。
+            -- ⚠️ 模式里的 `)` 必须转义成 `%)`：Lua 把它当捕获括号，
+            -- 未配对直接 "invalid pattern capture"（本轮踩到）。
+            if line:match("^%s*%)%s*$") then cur = nil end
         end
     end
     return byDev
@@ -573,9 +605,11 @@ local function applyTarget(t)
 
     local payload = mappingPayload()
     local want = expectedDecimals()
+    local lastOut = nil            -- 最后一次读回，失败时写进日志（排障用）
 
     for _, m in ipairs(matchersFor(t)) do
         local out, ok = runHidutil(m, payload)
+        lastOut = out
         local valueOK, deviceOK = hasAll(out, want), hitDevice(out, t)
 
         -- hidutil 的 --set 会把设置后的属性打印出来，直接拿它当读回校验，省一次进程。
@@ -599,19 +633,82 @@ local function applyTarget(t)
     end
 
     M.lastError = "无法向 " .. tostring(t.name) .. " 下发映射"
-    plog("%s（本轮失败，下一轮重试）", M.lastError)
+    -- **失败路径把读回内容带进日志**（2026-10-18 加）：hidutil 输出格式漂移时
+    -- （macOS 升级改了 regid 写法之类），映射照样每轮写上、只是校验认不出，
+    -- 没有这段原始输出，日志里只有干巴巴一句「无法下发」，看不出是格式问题。
+    plog("%s（本轮失败，下一轮重试）；最后一条命令读回：%s",
+        M.lastError, tostring(lastOut):sub(1, 300))
     print("[kbswap] " .. M.lastError)
     return false
 end
 
+--- 读回文本里**每一台设备、每一条配对**都是我们这套吗？
+--- 比 isOurMapping 严：isOurMapping 是「至少有一条是我们的」，用它当清除前的
+--- 闸门会误伤 —— 键盘上有我们的 + 鼠标上有用户自己的，混合读回同样满足
+--- 「至少一条是我们的」，于是清除动作把鼠标上用户自己的映射也清掉了。
+--- 注意这里按「十进制数值」判（parseMappingByDevice 收的就是数值列表）：
+--- 每台设备上的每个值都必须落在 expectedDecimals() 里。
+--- @param out string
+--- @return boolean
+local function allOurs(out)
+    local byDev = parseMappingByDevice(out)
+    local want = {}
+    for _, v in ipairs(expectedDecimals()) do want[v] = true end
+    for _, list in pairs(byDev) do
+        for _, v in ipairs(list) do
+            if not want[v] then return false end
+        end
+    end
+    return true
+end
+
 --- 撤销我们自己的映射。只清 applied 里记着的那些 —— 不碰设备上其它来源的映射。
+---
+--- ⚠️ **不能直接拿 rec.matcher 清**（2026-10-18 修）：键盘固件上报名对不上时，
+--- 当年下发用的 matcher 会退化到 Transport 兜底，那种 matcher 命中同一 BLE
+--- 传输下**所有** keyboard usage 设备 —— 包括用户自己用 hidutil 设过映射的
+--- 罗技鼠标。UserKeyMapping 是整数组属性，一条 `--set 空数组` 全部抹掉。
+--- 对策：按目标重新生成候选（VID/PID → Product → Transport，精确的在前），
+--- 精确 matcher 直接清；只有落到 Transport 兜底时才先读回，确认读到的
+--- **全都是我们这套**才清，否则宁可不清（留一行日志，用户可手动处理）。
 local function clearAll()
     for _, rec in pairs(applied) do
-        local out, ok = runHidutil(rec.matcher, EMPTY_MAP)
-        if M.debug then
-            print(string.format("[kbswap] 已撤销 %s（ok=%s）", tostring(rec.target.name), tostring(ok)))
+        local done = false
+        for _, m in ipairs(matchersFor(rec.target)) do
+            local risky = m:find('"Transport"') ~= nil
+            if risky then
+                local outR = runHidutil(m, nil, "UserKeyMapping")
+                if not allOurs(outR) then
+                    -- 读回里混着别人的映射：这个 matcher 清下去会误伤。
+                    -- Transport 是候选列表最后一个，循环到此结束。
+                    plog("撤销 %s 时跳过兜底匹配（读回里混着别人的映射，清了会误伤同传输的其它设备）：%s",
+                        tostring(rec.target.name), m)
+                    if M.debug then
+                        print("[kbswap] 跳过兜底撤销（读回不纯）：" .. m)
+                    end
+                else
+                    local _, ok = runHidutil(m, EMPTY_MAP)
+                    done = ok and true or false
+                    if M.debug then
+                        print(string.format("[kbswap] 已撤销 %s（%s，ok=%s）",
+                            tostring(rec.target.name), m, tostring(ok)))
+                    end
+                    if done then break end
+                end
+            else
+                -- 精确 matcher（VID/PID 或 Product）只可能命中这一台，直接清
+                local out, ok = runHidutil(m, EMPTY_MAP)
+                if ok and hitDevice(out, rec.target) then
+                    done = true
+                    if M.debug then
+                        print(string.format("[kbswap] 已撤销 %s（%s）",
+                            tostring(rec.target.name), m))
+                    end
+                    break
+                end
+            end
         end
-        if not ok then M.lastError = "撤销失败：" .. tostring(rec.target.name) end
+        if not done then M.lastError = "撤销失败：" .. tostring(rec.target.name) end
     end
     applied = {}
 end
@@ -619,10 +716,13 @@ end
 --- 清掉「我们自己下的」残留映射。
 --- 场景：改了配置重载 Hammerspoon，上一个实例的 applied 记录没了，但设备上还挂着映射。
 --- 先读回、逐条确认那是我们这套配对才清 —— 免得把用户自己用 hidutil 设的映射误删。
+--- ⚠️ 闸门必须是 allOurs（每台每套都是我们的）而不是 isOurMapping（至少一条）：
+--- 后者在「键盘有我们的 + 鼠标有用户的」混合读回下同样为真，清下去就误伤
+--- （2026-10-18 修，和 clearAll 同一个病根）。
 local function clearStale()
     for _, m in ipairs(transportMatchers()) do
         local out = runHidutil(m, nil, "UserKeyMapping")
-        if isOurMapping(out) then
+        if allOurs(out) then
             runHidutil(m, EMPTY_MAP)
             if M.debug then print("[kbswap] 清掉残留映射：" .. m) end
         end
@@ -705,6 +805,12 @@ end
 local function onEvent(e)
     -- 双保险：tap 只在交换态启动，这里再按 M.active 设一道闸 —— 就算有事件
     -- 漏进来（或状态切换瞬间），关闭/待机时也绝不碰事件。
+    -- **还要按引擎设一道闸**（2026-10-18 修）：从 eventtap 切回 hidutil 时，
+    -- 旧 tap 不会自己停（tick 的清理只在切换那一轮生效，手动改 M.engine 的
+    -- 窗口期内 tap 还活着）。onEvent 只查 M.active 的话，这段时间里内置键盘
+    -- 会被 eventtap 全局交换 —— 而状态行显示的是 hidutil 模式，用户完全
+    -- 看不出叠加。M.engine 是运行时改的（兜底试用场景），这道闸必须常在。
+    if M.engine ~= "eventtap" then return false end
     if not M.active then return false end
 
     -- eventtap 最怕写坏了把键盘吞掉：一旦出错就放行原事件，宁可交换失效
@@ -858,6 +964,20 @@ local function tickHidutil()
     local listOut = hs.execute(HIDUTIL .. " list --ndjson 2>&1")
     M.targets = filterTargets(aggregate(parseHidList(listOut)))
 
+    -- **分类缓存未就绪时，本轮只观察、不下结论**（2026-10-18 修）。
+    -- system_profiler 是**异步** task（约 0.2s 后才回调），而 tick 是同步的：
+    -- 冷启动那一轮 byName 还是空的，filterTargets「分类未知时保留设备」的
+    -- 保守策略就会把**蓝牙鼠标**也当键盘（罗技鼠标的 HID 里带 keyboard
+    -- usage，这是该策略存在的全部原因）。后果链：弹「Keyboard connected:
+    -- MX Anywhere 2S」错提示、给鼠标下发映射、M.lastDevice 显示鼠标名。
+    -- 等缓存到达的下一轮再决策，最多晚一个轮询周期（2 秒）。
+    -- ⚠️ 但不能无限等：task 真的失败过（failed>0）就得按老逻辑走 ——
+    -- 「宁可多认几个设备，也不漏掉真键盘」是既定的取舍。
+    if profilerCache.at == 0 and (profilerCache.failed or 0) == 0 then
+        plog("分类缓存未就绪（system_profiler 首次回调中）→ 本轮只观察不动作")
+        return
+    end
+
     -- ① 差集：上一轮在、本轮不在 ⇒ 这台设备的映射已经随服务移除而没了
     local nowKeys = {}
     for _, t in ipairs(M.targets) do nowKeys[t.key] = true end
@@ -903,6 +1023,15 @@ local function tickEventtap()
 end
 
 local function tick()
+    -- **引擎切换后的残留清理**（2026-10-18 修）：从 eventtap 切回 hidutil 时，
+    -- 旧 tap 不会自己停。onEvent 里的引擎闸能挡住交换，但 tap 本身还挂在
+    -- 系统上（每个事件都跑一趟 Lua 回调）—— 这里补上「不是 eventtap 就不该
+    -- 有 tap 在跑」的不变量。tapRunning 就是为这个准备的（见它的定义处注释）。
+    if M.engine ~= "eventtap" and tapRunning then
+        if M.tap then pcall(function() M.tap:stop() end) end
+        tapRunning = false
+        if M.debug then print("[kbswap] 引擎已切走，停掉残留的 eventtap") end
+    end
     if M.engine == "eventtap" then
         refreshProfiler(true)   -- eventtap 的开关完全靠它，每轮都刷
         tickEventtap()
@@ -935,6 +1064,12 @@ function M.clear()
     else
         if M.tap then M.tap:stop() end
         tapRunning = false
+        -- **eventtap 模式下也可能挂着 hidutil 的映射**（从 hidutil 切过来的
+        -- 残留）：「收回交换并停用」就该全收，否则键盘上的映射永远留着，
+        -- 而用户以为已经停用了（2026-10-18 修）。clearAll 幂等，无设备时
+        -- 只是两次空操作。
+        clearAll()
+        clearStale()
     end
     M.active = false
     refreshMenubar() -- mode 变了 tooltip 也要跟着变

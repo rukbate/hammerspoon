@@ -1,5 +1,15 @@
 --- osk.lua —— 屏幕键盘（蓝牙键盘断开时的应急输入设备）
 ---
+--- 模块世代令牌（2026-10-18 加）：`hs.timer`/`hs.eventtap`/canvas 都是 C 侧对象，
+--- **Reload Config 不会停掉它们**。旧模块的闭包链（timer → fn → M）不会被 GC，
+--- 于是开着键盘时 reload：旧画布、旧 tap、旧看门狗、旧采样器全部继续运行，
+--- 新模块再建一套 → 两个面板并存，每 reload 还静默漏一个 0.12s 永久采样 timer。
+--- 对策：每次加载递增 `_G.oskGen`，本模块闭包记下自己那代的 GEN；所有周期性
+--- 回调第一行检查「我还是不是最新一代」，不是就停掉自己（看门狗还会捎带停旧 tap）。
+--- show() 则负责删掉上一代遗留的画布。
+local GEN = (_G.oskGen or 0) + 1
+_G.oskGen = GEN
+---
 --- 用途：蓝牙键盘不在手边时，用鼠标/触控板给前台 App 打字。
 --- 开关：点击 kbswap 的菜单栏键盘图标（kbswap.lua 的 click 回调调本模块 toggle）。
 --- 备用：axkeyboard.lua（系统「无障碍键盘」开关）保留在盘上但不加载——
@@ -103,9 +113,20 @@ M.mousePollInterval = 0.12 -- 后台鼠标采样间隔（秒）。必须明显�
                          -- 0.12s 足够（AX 那边每层都是 IPC 级的开销，
                          -- 鼠标读一次只是取当前值，很便宜）。
 M.mouseAnchorHeight = 120 -- 鼠标位置只是个**点**，没有高度，直接拿来跟面板比重叠
-                         -- 毫无意义（点高 0）。所以在它**上方**造一个这么高的
-                         -- 「假想输入区」，只取它的**下缘**：面板停在鼠标上方，
-                         -- 就不会压住用户刚点击的那个位置。
+                        -- 毫无意义（点高 0）。所以在它**上方**造一个这么高的
+                        -- 「假想输入区」，只取它的**下缘**：面板停在鼠标上方，
+                        -- 就不会压住用户刚点击的那个位置。
+M.mouseAnchorMaxStill = 30 -- 「静置多久」的累积上限（秒）。
+                        -- 为什么必须有上限：still 在鼠标不动期间每 0.12s 一跳
+                        -- 无界增长，而锚点候选只跟「史上最久」竞争。不起这个
+                        -- 帽，鼠标静置半小时后 still=1800，之后在任何输入框前
+                        -- 的真实停顿（1~2 秒）都永远竞争不过它 —— 锚点锁死在
+                        -- 半小时前那个位置，避让慢性失效（2026-10-18 修）。
+                        -- 30 秒远大于真实停顿，不会误伤主路径。
+M.mouseAnchorMaxAge = 60  -- 锚点候选的保质期（秒）。超过这个年龄就弃用，
+                        -- 退回「当前鼠标位置」。主路径「停顿→移菜单栏→点图标」
+                        -- 全程 1~2 秒，远小于 60；而起身半小时回来时，旧锚点
+                        -- 早就不代表输入区了。和 MaxStill 是两道独立的保险。
 M.opacity     = 0.88    -- 面板不透明度（1 = 全实心）。Lin 要求半透明
                         -- （2026-10-02）：避让总有兜不住的时候（输入区可能占满
                         -- 整页、或根本探测不到），半透明是最后一道保险——
@@ -420,7 +441,13 @@ end
 --- 采集：设 `M.fnCaptureOn = true` 后 Reload，**慢慢按实体 FN 一下**（按下、停顿
 --- 一下、再松开）即自动存档。采完把 `M.fnCaptureOn` 设回 false（免得误覆盖）。
 M.fnDataPath  = os.getenv("HOME") .. "/.hammerspoon/fn-event.dat"
-M.fnCaptureOn = true     -- 采集期开着；拿到存档后设回 false
+--- **默认关闭**（2026-10-18 修）。这个开关曾经长期是 true，而它开着的时候：
+--- ① 每次 reload 后 `M.probeSeconds` 会自动开录 120 秒，期间每次按键都同步
+--- 落盘（打字直接背上文件 I/O）；② 这 120 秒内第一次实体 FN 会**覆盖**
+--- fn-event.dat（saveFnData 无备份）——辛苦录的存档可能被一次误触替换。
+--- 「诊断完就关」不能靠记性，默认值就必须是关。要采集时控制台手动开：
+---   hs.osk.fnCaptureOn = true → Reload → 慢慢按一下实体 FN
+M.fnCaptureOn = false    -- 采集期手动打开；拿到存档后设回 false
 
 --- **一次实体 FN 敲击 = 一串事件，不是「一个 down + 一个 up」**（2026-10-05 实测）。
 ---
@@ -533,10 +560,30 @@ end
 ---
 --- pcall 包住是因为 posting 在 tap 回调里，抛异常会让系统禁用整个 tap。
 ---
+--- FN 回放的状态：令牌 + 待执行的定时器句柄。
+--- 为什么需要：回放是「发一条 → 等 70ms → 发下一条」的异步序列。快速连点
+--- 屏幕 FN 时，两串回放会通过 doAfter 交错（D,D,D,U,U,U 或更乱），系统侧
+--- 「按 Fn 两次」的检测可能误判；hide() 之后 doAfter 仍会把 FN 事件打到
+--- 任意前台 App。令牌 + 句柄表让「新点击」和「hide」都能作废未完成的序列。
+local fnPlayToken = 0
+local fnPlayTimers = {}
+
+--- 作废正在进行中的 FN 回放：令牌 +1（旧 step 闭包发现自己过期就静默返回），
+--- 停掉所有待执行的 doAfter。**对任何状态都可调用**（幂等）。
+local function cancelFnSeq()
+    fnPlayToken = fnPlayToken + 1
+    for _, t in ipairs(fnPlayTimers) do
+        pcall(function() t:stop() end)
+    end
+    fnPlayTimers = {}
+end
+
 --- 回放按存档里的实测间隔走：组内 0.x ms 的连发**直接接着发**（排 doAfter 反而
 --- 被定时器的几毫秒粒度拉歪），组间 70ms 那种才真的等一下。
 local function playFnSeq()
     if not (fnSeq and #fnSeq > 0) then return false end
+    -- 先作废上一次没回放完的（快速连点场景），再开始新的一串
+    cancelFnSeq()
     -- 先造第一条：造不出来说明存档跟这台机器对不上（换过键盘/系统升级过），
     -- 立刻返回 false 让 tapFnKey 退回手工合成，别让 FN 变死键。
     -- **造出来就留着用**：拿它探完再扔、回放时又造一遍，等于同一条事件造两次。
@@ -544,9 +591,11 @@ local function playFnSeq()
         return hs.eventtap.event.newEventFromData(fnSeq[1].data)
     end)
     if not okFirst or not first then return false end
+    local myToken = fnPlayToken
     local i = 0
     local step
     step = function()
+        if myToken ~= fnPlayToken then return end   -- 被取消/被新一轮取代
         i = i + 1
         local e = fnSeq[i]
         if not e then return end
@@ -557,7 +606,10 @@ local function playFnSeq()
         end)
         if i < #fnSeq then
             local d = fnSeq[i + 1].ms or 0
-            if d >= 5 then hs.timer.doAfter(d / 1000, step) else step() end
+            if d >= 5 then
+                -- 句柄记账：cancelFnSeq 靠这个表把「还没发生」的步骤停掉
+                fnPlayTimers[#fnPlayTimers + 1] = hs.timer.doAfter(d / 1000, step)
+            else step() end
         end
     end
     step()
@@ -656,6 +708,12 @@ local function pressKey(k)
     k.pressed = true
     M._pressing = k
     local def = k.def
+    -- **任何新键按下都先停掉连发**（2026-10-18 修）。旧逻辑只在「松开的键
+    -- 自己是 rep」时停，于是「按住 ⌫ 连发 → 中途按一下别的键 → 松开」这条
+    -- 序列里没有任何一环碰那个定时器：⌫ 的连发会永远跑下去，只能收起键盘
+    -- 才能救。触控板多指操作很容易触发；reload 时正按住 rep 键还会跨 reload
+    -- 永久连发。startRepeat 内部也有 stopRepeat，这里不冲突。
+    stopRepeat()
     if def.mod then
         -- FN 除了上膛还要**真的发一次 fn 键**：只上膛不发键的话，「连按两次
         -- Fn」这类系统快捷键（听写）永远触发不了。见 tapFnKey 头注释。
@@ -791,7 +849,12 @@ end
 local function restoreFocusOnce()
     if not M._targetApp then return end
     local ok, front = pcall(hs.window.frontmostApplication)
-    if ok and isHammerspoon(front) then M._targetApp:activate() end
+    if ok and isHammerspoon(front) then
+        -- activate() 也包一层（2026-10-18 修）：它在 timer 回调里，
+        -- 目标 App 刚退出时会抛；虽然 timer 抛错只损失这一次还焦点，
+        -- 但四个时间点少一个就多一分「焦点留在 Hammerspoon」的概率。
+        pcall(function() M._targetApp:activate() end)
+    end
 end
 
 --------------------------------------------------------------------------------
@@ -895,6 +958,19 @@ end
 ---   在鼠标位置**上方**加一个合理高度，得到一个「假想输入区」矩形，
 ---   让它只提供**下缘**这个信息——面板停在鼠标上方就不会压住点击处。
 ---   标记为 `precise`（它比整页容器精确得多，比真光标粗但足够用）。
+--- 当前时间（秒）。优先单调时钟 `hs.timer.absoluteTime()`（纳秒，除 1e9 得秒），
+--- 没有才退回 `os.time()`。
+--- ⚠️ 两者量纲不同（前者是 Mach uptime 秒、后者是 epoch 秒，差着几十年），
+--- 但**同一模块内只用这一个来源算差值**，所以 age 比较是一致的。别混着算。
+--- @return number
+local function nowSeconds()
+    if hs.timer and hs.timer.absoluteTime then
+        local ok, t = pcall(hs.timer.absoluteTime)
+        if ok and t then return t / 1e9 end
+    end
+    return os.time()
+end
+
 --- 把一次采样记进「鼠标在哪儿停了多久」的账本。
 ---
 --- **必须是后台持续调用，不能只在 show() 时调一次**（2026-10-03 真机日志逼出来的）：
@@ -902,25 +978,24 @@ end
 --- 不成立 —— 用户点完输入框、移到菜单栏点图标（1~2s），这期间**一次都没采样**，
 --- 等 show() 第一次采样时账本还是空的。
 local function sampleMouse(x, y)
-    local now
-    if hs.timer and hs.timer.absoluteTime then
-        local okT, t = pcall(hs.timer.absoluteTime)
-        now = (okT and t) and t / 1e9 or os.time()
-    else
-        now = os.time()
-    end
+    local now = nowSeconds()
     local last = M._mouse
     local still = 0
     if last and last.x == x and last.y == y then
         still = (last.still or 0) + math.max(0, now - (last.t or now))
     end
+    -- **累积必须封顶**：不起这个帽，「史上最久」判据会被一次长时间不动永久
+    -- 夺走（见 M.mouseAnchorMaxStill 注释）。真实停顿 1~2 秒，30 秒够不着。
+    still = math.min(still, M.mouseAnchorMaxStill or 30)
     M._mouse = { x = x, y = y, t = now, still = still }
     -- 静置够久就存成「候选输入区」。取**静置最久**的那个，不是最新那个：
     -- 最新那个大概率是菜单栏（点图标那一刻鼠标在屏幕顶部）。
+    -- 候选同时存 `t`（记录时刻）—— mouseAnchor 靠它做陈旧判据，
+    -- 只靠 still 分高下的判据在没有时间轴的情况下会被旧点永久霸榜。
     local best = M._anchorBest
     local hold = M.mouseAnchorHold or 0.25
     if still >= hold and (not best or still > best.still) then
-        M._anchorBest = { x = x, y = y, still = still }
+        M._anchorBest = { x = x, y = y, still = still, t = now }
     end
 end
 
@@ -943,15 +1018,32 @@ local function startMousePoll()
     if M.useMouse == false then return end
     local iv = M.mousePollInterval or 0.12
     local function tick()
-        if M.useMouse == false then return end
-        local ok, pos = pcall(hs.mouse.absolutePosition)
-        -- **函数名是 absolutePosition，不是 getAbsolutePosition**（查本机
-        -- docs.json 确认）。写错会被 pcall 静默吞掉、整条路永不生效——
-        -- 跟 A3 那次 pcall(app) 一模一样的坑。
-        if ok and type(pos) == "table" and pos.x and pos.y then
-            -- **取整再比较**：CGFloat 带小数时，同一物理位置两次读回可能差 0.5，
-            -- 会被误判成「鼠标在动」，静置时间永远累积不起来。
-            sampleMouse(math.floor(pos.x + 0.5), math.floor(pos.y + 0.5))
+        -- **整回调包 pcall**（2026-10-18 加固）：`hs.timer.doEvery` 的回调抛一次
+        -- 异常，定时器就**永久停止且不恢复**（Hammerspoon 默认行为）。采样器是
+        -- 整条鼠标避让链的源头，它静默死亡 = 避让功能静默没有了，而屏幕上
+        -- 看不出任何异常。包住之后单次出错只损失一次采样。
+        local ok, err = pcall(function()
+            -- **世代检查**（2026-10-18 加）：被更新的模块取代了就停掉自己。
+            -- reload 不会停 C 侧 timer，没有这道闸的话每次 reload 都静默多一个
+            -- 0.12s 采样器永久在跑（旧闭包链持有旧 M，GC 收不走）。
+            if _G.oskGen ~= GEN then
+                if M._mouseTimer then pcall(function() M._mouseTimer:stop() end) end
+                M._mouseTimer = nil
+                return
+            end
+            if M.useMouse == false then return end
+            local okP, pos = pcall(hs.mouse.absolutePosition)
+            -- **函数名是 absolutePosition，不是 getAbsolutePosition**（查本机
+            -- docs.json 确认）。写错会被 pcall 静默吞掉、整条路永不生效——
+            -- 跟 A3 那次 pcall(app) 一模一样的坑。
+            if okP and type(pos) == "table" and pos.x and pos.y then
+                -- **取整再比较**：CGFloat 带小数时，同一物理位置两次读回可能差 0.5，
+                -- 会被误判成「鼠标在动」，静置时间永远累积不起来。
+                sampleMouse(math.floor(pos.x + 0.5), math.floor(pos.y + 0.5))
+            end
+        end)
+        if not ok then
+            diag("鼠标采样 tick 出错（已拦下，采样器继续跑）: %s", tostring(err))
         end
     end
     -- 把回调挂出来给测试驱动（测试里没有真timer，只能手动喂）。
@@ -1040,6 +1132,20 @@ local function mouseAnchor()
     local best = M._anchorBest
     local h = M.mouseAnchorHeight or 120
     local px, py
+    if best then
+        -- **陈旧判据（2026-10-18 修）**：锚点只代表「不久前鼠标在哪儿停了最久」。
+        -- 没有这道判据时，「史上最久」是一个永久霸榜的位子：起身半小时回来，
+        -- 旧点（still 已封顶 30s）照样压得住输入框前的真实停顿 —— 键盘会盖住
+        -- 真正的输入框，而且这个状态**不自愈**（新点必须超过史上记录才能翻身）。
+        -- 主路径「停顿→移菜单栏→点图标」全程 1~2 秒，远小于保质期，不受影响。
+        local age = best.t and (nowSeconds() - best.t) or 0
+        if age > (M.mouseAnchorMaxAge or 60) then
+            diag("鼠标静置点 (%.0f,%.0f) 已陈旧（%.0fs 前）→ 弃用，退回当前位置",
+                best.x, best.y, age)
+            M._anchorBest = nil
+            best = nil
+        end
+    end
     if best then
         px, py = best.x, best.y
         diag("用鼠标历史静置点 (%.0f,%.0f 停了%.2fs) → 假想输入区下缘 %.0f",
@@ -1401,9 +1507,16 @@ local function focusedInputInfo(frontApp)
     if frontApp and not isHammerspoon(frontApp) then
         local okW, w = pcall(function() return frontApp:focusedWindow() end)
         if okW then win = w end
-        diag("前台 App=%s 焦点窗口=%s",
-            frontApp and frontApp:name() or "?",
-            (win and win:title()) or "nil")
+        -- **这两行必须在 pcall 里**（2026-10-18 修）：`:name()` / `:title()`
+        -- 是裸调，而本函数被 show() 直接调（不在任何 pcall 里）。前台 App 在
+        -- 「取 frontmostApplication」和「调 :name()」之间退出时，异常会一路冒到
+        -- 菜单栏回调 —— 现象是「点图标打不开键盘」且一行日志都没有。
+        -- 这正是 2026-10-02「diag 把 show() 打断」同一类事故的残留结构。
+        pcall(function()
+            diag("前台 App=%s 焦点窗口=%s",
+                frontApp and frontApp:name() or "?",
+                (win and win:title()) or "nil")
+        end)
     end
 
     local function probe(el, label)
@@ -1806,9 +1919,13 @@ local function startRaiseWatcher()
     if M._raiseWatcher then return end
     local ok = pcall(function()
         M._raiseWatcher = hs.application.watcher.new(function(_, event)
-            if event == hs.application.watcher.activated and M.isShowing() then
-                hs.timer.doAfter(0.05, M.raise)
-            end
+            -- 包 pcall（2026-10-18 加固）：watcher 回调抛错的后果没有文档保证，
+            -- 而它整段都在「让面板保持最前」这条关键路径上。
+            pcall(function()
+                if event == hs.application.watcher.activated and M.isShowing() then
+                    hs.timer.doAfter(0.05, M.raise)
+                end
+            end)
         end)
         if M._raiseWatcher then M._raiseWatcher:start() end
     end)
@@ -1848,9 +1965,20 @@ end
 
 function M.show()
     stopRepeat()
+    cancelFnSeq()               -- 上一次没回放完的 FN 序列作废（见 playFnSeq）
     M._capturing = false
     M._drag = nil
     M._pressing = nil
+
+    -- **清掉上一代遗留的画布**（2026-10-18 加）。reload 时旧画布是 C 侧对象、
+    -- 不会跟着旧模块一起消失：旧 tap/看门狗/采样器靠世代令牌停，画布没人管。
+    -- 上一代 show() 时把自己的 canvas 记在 _G.oskLastCanvas，这里认领后删掉。
+    -- （记账在下面 build 之后做——此刻 M._canvas 还是上一代的残引用或 nil。）
+    local lastCanvas = _G.oskLastCanvas
+    if lastCanvas then
+        pcall(function() lastCanvas:delete() end)
+        diag("删掉了上一代模块遗留的画布（reload 前键盘开着）")
+    end
 
     -- 记下打开前的输入目标（点击 kbswap 菜单栏图标不会改变前台，
     -- 所以这里拿到的就是用户正在打字的 App）
@@ -1858,7 +1986,16 @@ function M.show()
     local ok, front = pcall(hs.window.frontmostApplication)
     if ok and front and not isHammerspoon(front) then M._targetApp = front end
 
-    local f = hs.screen.mainScreen():frame()
+    -- **mainScreen()/frame() 都要当可能抛的调用对待**（2026-10-18 修）：
+    -- 所有屏幕都断开时 mainScreen() 返回 nil，`:frame()` 就是「index a nil
+    -- value」，而这条路径整段在 pcall 之外 —— 异常会一路冒到调用 M.show()
+    -- 的菜单栏回调，现象是「点图标打不开键盘」且没有任何日志。
+    local okS, f = pcall(function() return hs.screen.mainScreen():frame() end)
+    if not okS or not f then
+        diag("mainScreen():frame() 拿不到（%s）→ 用全 0 兜底，面板会贴在 (0,0)",
+            tostring(f))
+        f = { x = 0, y = 0, w = 1440, h = 900 }
+    end
     local w, h = panelSize()
 
     -- 躲开输入区：优先用光标所在的细条，拿不到就用整个输入框/输入区，
@@ -1886,6 +2023,8 @@ function M.show()
 
     build(x, y)
     M._canvas:show()
+    -- 记账给下一代：reload 前的画布只有这个全局引用能看到（见 show 开头的清理）。
+    _G.oskLastCanvas = M._canvas
 
     for _, d in ipairs({ 0, 0.1, 0.3, 0.6 }) do
         hs.timer.doAfter(d, restoreFocusOnce)
@@ -1918,15 +2057,32 @@ function M.show()
     end
     -- 看门狗：回调若被系统禁用（异常/超时），5 秒内拉起
     if M._watchdog then M._watchdog:stop() end
-    M._watchdog = hs.timer.doEvery(5, function()
-        if M.isShowing() and M._tap and not M._tap:isEnabled() then
-            M._tap:start()
+    M._watchdog = hs.timer.doEvery(5, function(t)
+        -- 整回调包 pcall（2026-10-18 加固）：doEvery 回调抛一次定时器就永久停。
+        -- 看门狗是 tap 被系统禁用后的最后保险，它死了没人知道。
+        local ok, err = pcall(function()
+            -- **世代检查**（2026-10-18 加）：本模块已被 reload 取代时，看门狗是
+            -- 唯一还握着旧 tap 引用的周期回调——停下来之前顺手把旧 tap 也停掉，
+            -- 否则旧 tap 跟着旧画布一起活在系统里（新模块无权停它）。
+            if _G.oskGen ~= GEN then
+                if M._tap then pcall(function() M._tap:stop() end) end
+                pcall(function() t:stop() end)
+                M._watchdog = nil
+                return
+            end
+            if M.isShowing() and M._tap and not M._tap:isEnabled() then
+                M._tap:start()
+            end
+        end)
+        if not ok then
+            diag("tap 看门狗出错（已拦下，看门狗继续跑）: %s", tostring(err))
         end
     end)
 end
 
 function M.hide()
     stopRepeat()
+    cancelFnSeq()               -- 没回放完的 FN 序列作废，别把事件打到别的 App
     M._capturing = false
     M._drag = nil
     M._pressing = nil
@@ -1935,6 +2091,8 @@ function M.hide()
     stopRaiseWatcher()
     if M._watchdog then M._watchdog:stop() end
     M._watchdog = nil
+    -- 画布已隐藏，别再让下一代「清理」时去 delete 一个只是藏起来的对象
+    _G.oskLastCanvas = nil
 end
 
 function M.isShowing()
@@ -1981,7 +2139,10 @@ pcall(M.ensureMousePoll)
 -- 藏在 /tmp 里等于没写（2026-10-05 Lin 找不着它）。
 -- ============================================================================
 M.probeLog     = os.getenv("HOME") .. "/.hammerspoon/.workbuddy/hs-fn-probe.log"
-M.probeSeconds = 120     -- 自动录这么久；平时设 0 关掉
+--- **默认 0 = 不自动开录**（2026-10-18 修）。曾经默认 120，于是每次 reload
+--- 都自动录 2 分钟全键程。要录时控制台手动 `hs.osk.fnProbe(120)`，
+--- 或临时把这个数改大——**别让诊断工具默认常开**（见 fnCaptureOn 的注释）。
+M.probeSeconds = 0
 
 do
     local tap, lastMs, nRec = nil, nil, 0
@@ -2113,7 +2274,17 @@ do
                 -- 和「抬起」之间插几条无关事件，回放就不是实体那串了。
                 local noise = (type(rawFlags) == "number" and rawFlags == 0)
                 local isFnDown = (flagsTbl.fn == true) and not fnSeqClosing
+                -- 抬起也要查 fnSeqClosing（2026-10-18 修）：第一个 U 之后进入
+                -- 0.4s 收尾期，期间不再收任何事件。旧判据漏了这一条，收尾期
+                -- 内每个「kc=63 / systemDefined kc=0」都会被 splice 进存档
+                -- —— 实测数据里一次 FN 敲击的抬起是 2 条（systemDefined kc=0
+                -- + flagsChanged kc=63），多收的会在回放时误发出去。
+                -- ⚠️ 已知限制：「按住 FN 期间按媒体键」（systemDefined、kc=0、
+                -- flags 非 0 且无 fn 位）与抬起①的形态无法区分 —— 要加判据得
+                -- 先有「FN+媒体键」的真机实录。当前 fn-event.dat 不存在，这条
+                -- 路径不激活；采集到那种数据之前不加猜的判据。
                 local isFnUp = (not flagsTbl.fn) and (fnSeqBase ~= nil) and not noise
+                    and not fnSeqClosing
                     and (kc == 63 or (tName == "systemDefined" and kc == 0))
                 if isFnDown or isFnUp then
                     pcall(function()
