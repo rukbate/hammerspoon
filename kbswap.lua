@@ -40,7 +40,7 @@ M.mode         = "auto"     -- "auto" 跟随蓝牙键盘 | "off" 停用（eventt
 --- 自己看得见，落盘的这份是给「事情已经过去、只能看日志」准备的。
 --- 为什么放仓库里而不是 /tmp：Lin 找不到的日志等于没写（2026-10-05 的教训）。
 --- 日志路径可注入（M.logPath），测试里要存旧值再还原。
-M.logPath    = os.getenv("HOME") .. "/.hammerspoon/.workbuddy/kbswap.log"
+M.logPath    = (os.getenv("HOME") or ".") .. "/.hammerspoon/.workbuddy/kbswap.log"
 M.logMaxBytes = 512 * 1024    -- 超了就整份重写。诊断日志不需要跨天历史
 
 --- 写一行状态变迁日志。**绝不能抛**：诊断函数把功能搞挂是最讽刺的死法
@@ -474,6 +474,14 @@ local function refreshProfiler(force)
         M.lastDevice = keyboards[1] or M.lastDevice
     end, PROFILER_ARGS)
 
+    -- hs.task.new 在进程创建失败时返回 nil（2026-10-19 加）：直接 :start() 会抛
+    if not task then
+        profilerCache.pending = false
+        profilerCache.failed = (profilerCache.failed or 0) + 1
+        if M.debug then print("[kbswap] system_profiler 进程创建失败（task 为 nil）") end
+        return false
+    end
+
     task:start()
     return true
 end
@@ -501,7 +509,7 @@ end
 -- 四、下发与撤销
 --------------------------------------------------------------------------------
 
---- key -> { target, matcher, sig, at }
+--- key -> { target, matcher, sig }
 local applied = {}
 
 --- 按设备把 hidutil 读回的属性文本拆开，收集每台设备上的**十进制数值**。
@@ -615,8 +623,9 @@ local function applyTarget(t)
         -- hidutil 的 --set 会把设置后的属性打印出来，直接拿它当读回校验，省一次进程。
         -- 两层都要过：值里有我们那套 src/dst，且命中的是这台设备自己的 RegistryID。
         if ok and valueOK and deviceOK then
-            applied[t.key] = { target = t, matcher = m, sig = t.sig, at = os.time() }
+            applied[t.key] = { target = t, matcher = m, sig = t.sig }
             M.lastError = nil
+            M.lastFailDetail = nil   -- 成功了，失败去重的记忆也清掉
             plog("已下发 ⇄ -> %s（%s）", tostring(t.name), m)
             if M.debug then
                 print(string.format("[kbswap] 已下发 -> %s（%s）", tostring(t.name), m))
@@ -636,9 +645,15 @@ local function applyTarget(t)
     -- **失败路径把读回内容带进日志**（2026-10-18 加）：hidutil 输出格式漂移时
     -- （macOS 升级改了 regid 写法之类），映射照样每轮写上、只是校验认不出，
     -- 没有这段原始输出，日志里只有干巴巴一句「无法下发」，看不出是格式问题。
-    plog("%s（本轮失败，下一轮重试）；最后一条命令读回：%s",
+    -- **同一台设备连续失败的输出几乎不变**（2026-10-19 加）：每 2 秒打一遍
+    -- 等于刷屏，内容没变就只重试不吭声；变了（读回内容漂移）才再打。
+    local detail = string.format("%s（本轮失败，下一轮重试）；最后一条命令读回：%s",
         M.lastError, tostring(lastOut):sub(1, 300))
-    print("[kbswap] " .. M.lastError)
+    if M.lastFailDetail ~= detail then
+        M.lastFailDetail = detail
+        plog("%s", detail)
+        print("[kbswap] " .. M.lastError)
+    end
     return false
 end
 
@@ -954,10 +969,10 @@ local function shouldApply()
     return #M.targets > 0
 end
 
---- 上一轮出现过的目标 key、以及「曾经消失过」的 key 集合。
+--- 上一轮出现过的目标 key 集合。
 --- 设备从 HID 列表里消失 = 它的 HID 服务被移除过 = 映射必然丢失。所以下次出现时
 --- 无论 regid 变没变，都必须重挂——这一条和时间无关，是 HID 层的物理事实。
-local lastTargetKeys, goneKeys = {}, {}
+local lastTargetKeys = {}
 
 --- hidutil 引擎的一轮：发现设备 -> 下发/撤销 -> 广播状态变化。
 local function tickHidutil()
@@ -979,20 +994,21 @@ local function tickHidutil()
     end
 
     -- ① 差集：上一轮在、本轮不在 ⇒ 这台设备的映射已经随服务移除而没了
+    -- （2026-10-19 审查：原来还维护了一个 goneKeys 集合做去重，但它每轮末尾
+    -- 就被清空、跨轮根本去不了重，同轮内 lastTargetKeys 的 key 又天然唯一
+    -- ——纯死代码，删了。「目标离开」本来也只会打一行。）
     local nowKeys = {}
     for _, t in ipairs(M.targets) do nowKeys[t.key] = true end
     for key in pairs(lastTargetKeys) do
-        if not nowKeys[key] and not goneKeys[key] then
-            goneKeys[key] = true
+        if not nowKeys[key] then
             plog("目标离开：%s（HID 服务被移除，映射随之丢失）", key)
         end
     end
 
     -- ② 「重新出现」的强制重挂**不需要单独写**：下一段的读回验证会自动发现
     -- 映射没了（HID 服务重建后属性就是空的）并重挂。2026-10-17 反向验证时发现，
-    -- 专门记 goneKeys 再清 applied 的那段是冗余的——注回它测试照样全绿。
+    -- 专门记账再清 applied 的那段是冗余的——注回它测试照样全绿。
     lastTargetKeys = nowKeys
-    goneKeys = {}
 
     if shouldApply() then
         local okCount = 0
@@ -1001,11 +1017,12 @@ local function tickHidutil()
         end
         M.active = okCount > 0
         M.lastDevice = M.targets[1] and M.targets[1].name or nil
-        if M.active then M.lastError = nil end   -- 至少一把挂上了就别再顶着旧错误
+        if M.active then M.lastError = nil; M.lastFailDetail = nil end   -- 至少一把挂上了就别再顶着旧错误
     else
         clearAll()
         M.active = false
         M.lastError = nil                        -- 设备都没了，失败原因也该跟着清
+        M.lastFailDetail = nil
     end
 end
 

@@ -16,7 +16,8 @@ local M = {}
 -- 内部工具
 --------------------------------------------------------------------------------
 
---- 诊断日志：/tmp/hs-window.log
+--- 诊断日志：~/.hammerspoon/.workbuddy/hs-window.log
+--- （2026-10-19 从 /tmp 挪出：Lin 找不到的日志等于没写，项目日志统一放 .workbuddy/）
 ---
 --- **必须记「每次热键实际作用到了哪个窗口」**，因为这类故障在屏幕上完全看不出来
 --- （Lin 2026-10-03 报「⌃⌥⌘ 方向键四个都不行了」，看起来像热键没绑定，
@@ -25,7 +26,7 @@ local M = {}
 ---   ② 拿到的是 Hammerspoon 自己的窗口（键盘画布）→ 按了等于按在键盘上
 ---   ③ 拿到了真窗口但 setFrame 失败
 --- 不记的话就只能靠猜，而「猜」正是这个项目反复栽跟头的地方。
-local LOG = "/tmp/hs-window.log"
+local LOG = (os.getenv("HOME") or ".") .. "/.hammerspoon/.workbuddy/hs-window.log"
 local function diag(fmt, ...)
     local ok, msg = pcall(string.format, fmt, ...)
     if not ok then msg = fmt end
