@@ -892,11 +892,27 @@ local GLYPH_ON, GLYPH_OFF = "⌨", "⌥⌘" -- PNG 加载失败时的兜底字�
 
 local lastIconState = nil
 
---- 当前是否有蓝牙键盘在线。两个引擎的信息源不同：
+--- 当前是否有「真键盘」在线。两个引擎的信息源不同：
 --- hidutil 直接看 HID 枚举（5 秒一轮，准）；eventtap 只能靠 system_profiler
 --- 的异步分类结果，最多滞后一轮轮询。
+--- ⚠️ hidutil 侧**只认「分类明确是 Keyboard」的目标**（Lin 2026-10-20 报）：
+--- V3 小键盘 Free3-P 在 HID 里带键盘 usage，分类滞后期会被 filterTargets 的
+--- 保守策略（「分类未知时保留」）短暂收进 targets，直接数 #targets 会在它
+--- 一连上时弹「Keyboard connected」、分类到达后又弹 disconnected —— 全是噪声。
+--- 图标同理：只为真键盘亮。断开方向不受影响：目标从 targets 消失 ⇒ 立即 false，
+--- 不吃 profilerTTL 的缓存滞后。
 local function keyboardConnected()
-    if M.engine == "hidutil" then return #M.targets > 0 end
+    if M.engine == "hidutil" then
+        -- 兜底：分类 task 失败过且缓存一直空着 ⇒ 退回老判据
+        --（宁可误报一次，也不在系统拿不到分类时永远静默）。
+        if (profilerCache.failed or 0) > 0 and next(profilerCache.byName) == nil then
+            return #M.targets > 0
+        end
+        for _, t in ipairs(M.targets) do
+            if profilerCache.byName[norm(t.name)] == "Keyboard" then return true end
+        end
+        return false
+    end
     return #profilerCache.keyboardNames > 0
 end
 
