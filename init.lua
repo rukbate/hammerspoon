@@ -15,3 +15,4 @@ require "screen"
 require "osk"      -- 自绘屏幕键盘（v3 事件拦截版；kbswap 图标点击开关，先于 kbswap 加载）
 -- require "axkeyboard" -- 备用：系统「无障碍键盘」开关（能用但每次要开系统设置）
 require "kbswap"
+require "audiopriority" -- 默认输入设备优先级（2026-10-21）：无线麦靠电平判断真麦在不在线，别只认接收器
