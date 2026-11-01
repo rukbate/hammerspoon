@@ -80,7 +80,10 @@ end
 M._plog = plog   -- 暴露给测试与排障（直接验证「格式化失败也不抛」这类边界）
 
 M.pollInterval = 2          -- 检测间隔（秒）。5 秒偏慢：蓝牙键盘重连后的空窗体感明显
-M.profilerTTL  = 30         -- system_profiler 结果的缓存时间（秒），它是唯一慢的一环
+M.profilerTTL  = 5          -- system_profiler 结果的缓存时间（秒）。2026-11-01 从 120
+                            -- 调到 5：图标配判据改为跟蓝牙层走（见 keyboardConnected），
+                            -- 键盘真关机后图标要在 TTL 内熄灭；Lin 要求更快，5s 一轮。
+                            -- fork 一次 ~0.3s CPU、异步执行，每分钟 12 次可接受
 M.reassert     = 60         -- ⚠️ 已不再参与判定（2026-10-17）。原为「每隔多久重挂一次
                              -- 映射」的兜底，现由每轮读回验证取代。留着只为兼容旧配置。
 M.swapRight    = true       -- 是否连右侧 ⌥/⌘（usage 0xE6/0xE7）一起换
@@ -858,7 +861,14 @@ local function statusLine()
         -- 于是真出问题那天，图标看着正常、tooltip 却谎报没键盘 —— 排查时等于没有线索。
         state = "下发失败：" .. M.lastError
     elseif M.engine == "hidutil" then
-        state = "待机（无蓝牙键盘）"
+        -- 图标跟蓝牙层走之后（2026-11-01），「图标亮 + 未交换」= 键盘休眠中
+        -- （蓝牙连着、HID 服务被摘）。状态行必须把这个说出来，不能谎报
+        -- 「无蓝牙键盘」——那和实心图标自相矛盾。
+        if #profilerCache.keyboardNames > 0 then
+            state = "蓝牙已连，键盘休眠中（按任意键唤醒交换）"
+        else
+            state = "待机（无蓝牙键盘）"
+        end
     else
         state = "待机"
     end
@@ -892,26 +902,25 @@ local GLYPH_ON, GLYPH_OFF = "⌨", "⌥⌘" -- PNG 加载失败时的兜底字�
 
 local lastIconState = nil
 
---- 当前是否有「真键盘」在线。两个引擎的信息源不同：
---- hidutil 直接看 HID 枚举（5 秒一轮，准）；eventtap 只能靠 system_profiler
---- 的异步分类结果，最多滞后一轮轮询。
---- ⚠️ hidutil 侧**只认「分类明确是 Keyboard」的目标**（Lin 2026-10-20 报）：
---- V3 小键盘 Free3-P 在 HID 里带键盘 usage，分类滞后期会被 filterTargets 的
---- 保守策略（「分类未知时保留」）短暂收进 targets，直接数 #targets 会在它
---- 一连上时弹「Keyboard connected」、分类到达后又弹 disconnected —— 全是噪声。
---- 图标同理：只为真键盘亮。断开方向不受影响：目标从 targets 消失 ⇒ 立即 false，
---- 不吃 profilerTTL 的缓存滞后。
+--- 当前是否有「真键盘」在线（菜单栏图标 + 上下线提示的判据）。
+--- **跟蓝牙层走，不跟 HID 层**（2026-11-01 改，Lin 报「蓝牙明明连着，图标灭了
+--- 几十分钟」）：BLE 键盘省电休眠时 macOS 会把 HID 服务摘掉（hidutil list 里
+--- 消失），但蓝牙链路还在、系统设置里仍显示「已连接」——实测 Free3-P 休眠时
+--- 正是这个形态（蓝牙层 Connected、HID 层已消失，且可持续几分钟以上）。
+--- 旧判据看 M.targets（HID 层），于是休眠期间图标灭、提示弹「disconnected」，
+--- 与用户在蓝牙面板看到的状态相反。现在换成 system_profiler 的「已连接 +
+--- Minor Type=Keyboard」，两层一致；休眠与在用的差别由 tooltip/状态行区分。
+--- ⚠️ Free3-P 的 Minor Type 是 Mouse，不在此列（2026-10-20「只为真键盘亮」
+--- 的修复保持不变）。
+--- ⚠️ 交换是否生效仍看 HID 层（shouldApply / #M.targets）：HID 服务被摘 =
+--- 映射必然丢失（TN2450），重连后 2 秒内自动重挂，这与图标无关。
+--- 兜底：分类 task 失败过且缓存一直空着 ⇒ 退回 HID 判据（宁可误报一次，也不在
+--- 系统拿不到分类时永远静默）。
 local function keyboardConnected()
-    if M.engine == "hidutil" then
-        -- 兜底：分类 task 失败过且缓存一直空着 ⇒ 退回老判据
-        --（宁可误报一次，也不在系统拿不到分类时永远静默）。
-        if (profilerCache.failed or 0) > 0 and next(profilerCache.byName) == nil then
-            return #M.targets > 0
-        end
-        for _, t in ipairs(M.targets) do
-            if profilerCache.byName[norm(t.name)] == "Keyboard" then return true end
-        end
-        return false
+    if M.engine == "hidutil"
+        and (profilerCache.failed or 0) > 0
+        and next(profilerCache.byName) == nil then
+        return #M.targets > 0
     end
     return #profilerCache.keyboardNames > 0
 end
@@ -935,6 +944,11 @@ local function refreshMenubar()
     local tip
     if connected then
         tip = "蓝牙键盘已连接" .. (M.lastDevice and ("：" .. M.lastDevice) or "")
+        -- 蓝牙层已连但 HID 层还没跟上（省电休眠中）：解释交换为什么暂时没生效，
+        -- 别让「图标亮着但 ⌘/⌥ 没换」看起来像坏了（2026-11-01 加）。
+        if M.engine == "hidutil" and #M.targets == 0 then
+            tip = tip .. "（休眠中，按任意键唤醒交换）"
+        end
     else
         tip = "蓝牙键盘未连接"
     end
