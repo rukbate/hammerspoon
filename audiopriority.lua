@@ -47,11 +47,13 @@ local M = {}
 
 M.ffmpeg           = "/opt/homebrew/bin/ffmpeg"
 M.sampleSeconds    = 2     -- 每次电平采样录多少秒。太短底噪估不准，太长反应慢
-M.interval         = 5     -- 轮询间隔（秒）。发射器开关机的感知延迟 ≈ interval + sampleSeconds
+M.interval         = 15    -- 轮询间隔（秒）。发射器开关机的感知延迟 ≈ interval + sampleSeconds。
+                            -- 2026-10-24 从 5 调到 15（CPU 优化：每 5 秒 fork 一次 ffmpeg
+                            -- 是 Hammerspoon 生态最大热源 ~5-8%；15 秒感知延迟 ≈17s 可接受）
 M.silenceThreshold = -80   -- dB：采样电平低于它视为「麦没开」。发射器关机是精确 -inf，
                             -- 在线最弱实测也有 -62，取 -80 两头都留 18dB 余量。
                             -- 校准：看日志 level 行对比开 / 关时的读数，取中间值
-M.freshWindow      = 15    -- 电平采样有效期（秒）。超期视为未知，该规则作废
+M.freshWindow      = 20    -- 电平采样有效期（秒）。超期视为未知，该规则作废（必须 > interval）
 M.hangTimeout      = 20    -- 看门狗：单次采样超过这么多秒还没回调，判定卡死，杀任务重试
 
 --- 优先级表，从上到下，第一个合格的胜出。
@@ -83,7 +85,7 @@ M._skipCount       = 0    -- 因上一轮还没采完而跳过的 tick 数（看
 M._lastPolicy      = nil  -- 上一次策略裁决摘要（去重用）
 
 --- 菜单栏标题用的短名
-local SHORT = { ["Wireless Mic Rx"] = "Rx", ["HP S1X sound bar"] = "S1X" }
+local SHORT = { ["Wireless Mic Rx"] = "DJI", ["HP S1X sound bar"] = "HP" }
 
 --------------------------------------------------------------------------------
 -- 工具

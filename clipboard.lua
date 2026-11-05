@@ -17,7 +17,7 @@
 ]]
 
 -- Feel free to change those settings
-local frequency = 0.8 -- Speed in seconds to check for clipboard changes. If you check too frequently, you will loose performance, if you check sparsely you will loose copies
+local frequency = 2.0 -- Seconds between clipboard change checks. 2026-10-24: 0.8 → 2.0 (CPU 优化，连续两次拷贝间隔 <2s 且内容不同的场景极罕见)
 local hist_size = 100 -- How many items to keep on history
 local label_length = 70 -- How wide (in characters) the dropdown menu should be. Copies larger than this will have their label truncated and end with "…" (unicode for elipsis ...)
 local honor_clearcontent = true --asmagill request. If any application clears the pasteboard, we also remove it from the history https://groups.google.com/d/msg/hammerspoon/skEeypZHOmM/Tg8QnEj_N68J

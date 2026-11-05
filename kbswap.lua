@@ -489,20 +489,50 @@ local function refreshProfiler(force)
     return true
 end
 
+--- 分类缓存是否可信到「设备不在缓存里就能断定它不是刚进来的键盘以外的东西」：
+--- ① 至少成功回调过一次（at > 0）；
+--- ② 够新 —— 距上次成功刷新 ≤ 2×TTL（正常每 TTL 一刷；超过 2×TTL 还没动静，
+---    说明 task 卡住或失败中，此时缓存内容不能代表当下）；
+--- ③ byName 非空 —— system_profiler 输出格式漂移时会**静默解析出空表**，
+---    不能把「谁都不认识」当成「谁都不是键盘」。
+--- 三条缺一不可；缺任何一条都退回「未知保留」的老保守策略。
+local function profilerTrustworthy()
+    if profilerCache.at == 0 then return false end
+    if next(profilerCache.byName) == nil then return false end
+    return (os.time() - profilerCache.at) <= M.profilerTTL * 2
+end
+
 --- 把 HID 里的候选设备过滤成「确实是键盘」的目标。
 --- 判断依据：HID 里带键盘 usage 的蓝牙设备中，排除掉 system_profiler 明确标成非键盘的
 --- （典型就是罗技鼠标 —— 它的 HID 里带 keyboard usage，会被误判成键盘）。
---- 分类信息缺失时保留设备，宁可换错也不要不换。
+--- **分类未知（缓存可信但设备不在缓存里）→ 先不动作**（2026-11-04 修）：
+--- 设备刚连上/刚唤醒时，TTL 5 秒的异步缓存里还没有它，老策略「未知一律保留」
+--- 会把鼠标也下发 ⌘⇄⌥ —— 真机日志 2026-10-17 ~ 11-04 每天 2~5 条
+--- 「已下发 ⇄ -> MX Anywhere 2S」全是它。等一轮刷新（最多 TTL+一个轮询
+--- 周期 ≈ 7 秒）真键盘就入册；真键盘重连本来就要 6~8 秒建 HID 服务，
+--- 晚这一拍没有体感，而「天天给鼠标挂映射」是实打实的 bug。
+--- 缓存**不可信**（见 profilerTrustworthy）时退回老策略「未知保留」：
+--- 宁可多换也不漏键盘 —— profiler 坏了不能让交换整个瘫掉。
 --- @param candidates table
 --- @return table
 local function filterTargets(candidates)
+    local trusted = profilerTrustworthy()
     local out = {}
     for _, t in ipairs(candidates) do
         local minor = t.name and profilerCache.byName[norm(t.name)]
-        if not (minor and minor ~= "Keyboard") then
+        if minor == "Keyboard" then
             out[#out + 1] = t
-        elseif M.debug then
-            print("[kbswap] 跳过非键盘设备：" .. tostring(t.name) .. "（" .. minor .. "）")
+        elseif minor and minor ~= "Keyboard" then
+            if M.debug then
+                print("[kbswap] 跳过非键盘设备：" .. tostring(t.name) .. "（" .. minor .. "）")
+            end
+        elseif trusted then
+            -- 分类未知 + 缓存可信：设备多半是刚连上、还没进缓存，等下一轮
+            if M.debug then
+                print("[kbswap] 分类未知（缓存可信）暂不动作：" .. tostring(t.name))
+            end
+        else
+            out[#out + 1] = t
         end
     end
     return out
@@ -1011,8 +1041,8 @@ local function tickHidutil()
 
     -- **分类缓存未就绪时，本轮只观察、不下结论**（2026-10-18 修）。
     -- system_profiler 是**异步** task（约 0.2s 后才回调），而 tick 是同步的：
-    -- 冷启动那一轮 byName 还是空的，filterTargets「分类未知时保留设备」的
-    -- 保守策略就会把**蓝牙鼠标**也当键盘（罗技鼠标的 HID 里带 keyboard
+    -- 冷启动那一轮 byName 还是空的，filterTargets 退回「未知保留」的保守
+    -- 策略就会把**蓝牙鼠标**也当键盘（罗技鼠标的 HID 里带 keyboard
     -- usage，这是该策略存在的全部原因）。后果链：弹「Keyboard connected:
     -- MX Anywhere 2S」错提示、给鼠标下发映射、M.lastDevice 显示鼠标名。
     -- 等缓存到达的下一轮再决策，最多晚一个轮询周期（2 秒）。

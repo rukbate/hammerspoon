@@ -848,7 +848,13 @@ end
 --- 立即 + 延迟三次检查，前台仍是 Hammerspoon 就把目标 App 拉回来。
 local function restoreFocusOnce()
     if not M._targetApp then return end
-    local ok, front = pcall(hs.window.frontmostApplication)
+    -- ⚠️ 必须是 hs.application.frontmostApplication（2026-11-04 修）：
+    -- hs.window 下**没有**这个函数（docs.json 实查，hs.window 只有
+    -- frontmostWindow）。原先写错对象，pcall 把「调用 nil」吞掉，
+    -- _targetApp 记了也永远没人还原 —— 前台停在 Hammerspoon、
+    -- 敲出去的键没有落点，且日志零痕迹。失败路径的 diag 在 show() 里
+    -- （diag 定义在本函数之后，这里引用会是 global nil，放不得）。
+    local ok, front = pcall(hs.application.frontmostApplication)
     if ok and isHammerspoon(front) then
         -- activate() 也包一层（2026-10-18 修）：它在 timer 回调里，
         -- 目标 App 刚退出时会抛；虽然 timer 抛错只损失这一次还焦点，
@@ -1982,9 +1988,18 @@ function M.show()
 
     -- 记下打开前的输入目标（点击 kbswap 菜单栏图标不会改变前台，
     -- 所以这里拿到的就是用户正在打字的 App）
+    -- API 修正见 restoreFocusOnce 的注释（2026-11-04）：hs.window 下没有
+    -- frontmostApplication。这里必须把失败写进 diag —— 死代码那 7 年里
+    -- 这条路径无声无息，就因为 pcall 吞掉错误后没人吭声。
     M._targetApp = nil
-    local ok, front = pcall(hs.window.frontmostApplication)
-    if ok and front and not isHammerspoon(front) then M._targetApp = front end
+    local ok, front = pcall(hs.application.frontmostApplication)
+    if not ok then
+        diag("show: 取前台 App 抛错（%s）→ 焦点还原整段不可用", tostring(front))
+    elseif not front then
+        diag("show: 前台没有 App（frontmostApplication 返回 nil）→ 键盘敲出去没有落点")
+    elseif not isHammerspoon(front) then
+        M._targetApp = front
+    end
 
     -- **mainScreen()/frame() 都要当可能抛的调用对待**（2026-10-18 修）：
     -- 所有屏幕都断开时 mainScreen() 返回 nil，`:frame()` 就是「index a nil
